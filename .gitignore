@@ -1,0 +1,26 @@
+/target/
+# kstress embeddings build (separate target dir, built on glibc>=2.38) +
+# fastembed's downloaded model cache.
+/target-emb/
+# Isolated target dir used to build/test while a `cargo run` holds /target/ locked.
+/target-beam/
+/.fastembed_cache/
+**/__pycache__/
+*.pyc
+*.log
+.env
+.env.*
+
+# IDE / editor leftovers.
+.vscode/
+.idea/
+
+# auto-bench cache: Linux binary builds + downloaded release archives.
+/.cache/
+
+# ── All local artifacts live under local/ — NEVER shared. ──
+# Input datasets (downloaded / converted) AND raw results + run reports: every-
+# thing regenerable via the drivers. We ship how to RUN the bench (drivers,
+# converters, docs, and the datasets/ config manifest), never the data or the
+# numbers. Drivers write reports to local/runs/; converters default to local/.
+/local/

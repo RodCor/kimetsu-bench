@@ -1,0 +1,64 @@
+# Empty `[workspace]` table tells cargo this manifest is its own
+# workspace root, even though it lives inside another git working
+# tree that has a Cargo.toml with `[workspace]` at the top. Required
+# because `./bench/` is gitignored from kimetsu and not a member of
+# kimetsu's workspace; without this cargo refuses to build.
+[workspace]
+
+[package]
+name = "kimetsu-bench"
+version = "0.2.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Rodrigo Cordoba"]
+description = "Benchmark harness for kimetsu: Terminal-Bench, LongMemEval, BEAM, BrainBench, and the kstress brain profiler."
+publish = false
+
+[[bin]]
+name = "kbench"
+path = "src/main.rs"
+
+# Brain stress-test harness. Profiles the LOCAL v1.0.0 brain (seed 100 → 1M
+# memories: insert/query latency, db size, concurrency) and the REMOTE
+# `kimetsu-remote` HTTP server, across lean (FTS) + embeddings (vec0 ANN)
+# matrices. Built from local `../crates` source only — never a release.
+[[bin]]
+name = "kstress"
+path = "src/bin/kstress/main.rs"
+
+[features]
+# Forward to kimetsu-brain's embeddings feature so a `kstress` built with
+# `--features embeddings` loads fastembed (BGE-small) + sqlite-vec and can run
+# the embeddings matrix. The lean matrix runs from the SAME binary at runtime
+# via KIMETSU_BRAIN_EMBEDDER=noop. Default OFF keeps `kbench` lean.
+default = []
+embeddings = ["kimetsu-brain/embeddings"]
+
+[dependencies]
+# Path deps into the sibling kimetsu working tree. When this repo is
+# cloned to ./bench/ inside the kimetsu repo, ../crates/* resolves
+# correctly. Run `cargo build` from inside ./bench/.
+kimetsu-agent = { path = "../crates/kimetsu-agent" }
+kimetsu-brain = { path = "../crates/kimetsu-brain" }
+kimetsu-core = { path = "../crates/kimetsu-core" }
+
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+
+# One-command pipeline support:
+# - ureq: blocking HTTP for GitHub release download + kstress remote load (no
+#   tokio runtime; one blocking client per worker thread).
+# - dirs: cross-platform $HOME / ~ resolution for ~/.claude, ~/.codex.
+ureq = { version = "2", features = ["json"] }
+dirs = "5"
+
+# kstress opens brain.db directly to bulk-seed + measure size/concurrency.
+# Version + bundled MUST match the workspace pin (../Cargo.toml) so cargo
+# links a SINGLE bundled SQLite across the graph (incl. the sqlite-vec build
+# kimetsu-brain links under `embeddings`).
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Used by the LongMemEval driver for per-instance temp brain workspaces.
+tempfile = "3"

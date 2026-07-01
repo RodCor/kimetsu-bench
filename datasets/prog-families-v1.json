@@ -1,0 +1,100 @@
+{
+  "version": "1",
+  "description": "Programming language families — 49 tasks from Terminal-Bench, grouped by primary language/paradigm. Use with: kbench --family <name>",
+  "families": {
+    "python": {
+      "description": "Python engineering tasks (async, packaging, migration, scripting)",
+      "tasks": [
+        "cancel-async-tasks",
+        "cobol-modernization",
+        "headless-terminal",
+        "modernize-scientific-stack",
+        "pypi-server",
+        "video-processing",
+        "write-compressor"
+      ]
+    },
+    "c-cpp": {
+      "description": "C and C++ systems programming (compilation, graphics, memory, cross-compilation)",
+      "tasks": [
+        "build-pmars",
+        "build-pov-ray",
+        "compile-compcert",
+        "custom-memory-heap-crash",
+        "gpt2-codegolf",
+        "make-doom-for-mips",
+        "path-tracing",
+        "sqlite-with-gcov"
+      ]
+    },
+    "javascript": {
+      "description": "JavaScript and Node.js tasks (security filters, binary parsing, emulators)",
+      "tasks": [
+        "break-filter-js-from-html",
+        "extract-elf",
+        "filter-js-from-html",
+        "make-mips-interpreter"
+      ]
+    },
+    "r": {
+      "description": "R language and statistical computing (Bayesian inference, MCMC, Stan)",
+      "tasks": [
+        "adaptive-rejection-sampler",
+        "bn-fit-modify",
+        "distribution-search",
+        "mcmc-sampling-stan",
+        "rstan-to-pystan"
+      ]
+    },
+    "functional": {
+      "description": "Functional and formal languages (OCaml, Scheme, Coq, HDL)",
+      "tasks": [
+        "circuit-fibsqrt",
+        "fix-ocaml-gc",
+        "prove-plus-comm",
+        "schemelike-metacircular-eval"
+      ]
+    },
+    "sql": {
+      "description": "SQL and data querying languages (SQLite, SPARQL, WAL recovery)",
+      "tasks": [
+        "db-wal-recovery",
+        "query-optimize",
+        "sparql-university",
+        "sqlite-db-truncate"
+      ]
+    },
+    "ml": {
+      "description": "Machine learning frameworks (PyTorch, Caffe, HuggingFace, fastText)",
+      "tasks": [
+        "caffe-cifar-10",
+        "hf-model-inference",
+        "llm-inference-batching-scheduler",
+        "pytorch-model-cli",
+        "pytorch-model-recovery",
+        "torch-pipeline-parallelism",
+        "torch-tensor-parallelism",
+        "train-fasttext"
+      ]
+    },
+    "scientific": {
+      "description": "Scientific computing (bioinformatics, physics simulation, numerical methods)",
+      "tasks": [
+        "dna-assembly",
+        "dna-insert",
+        "largest-eigenval",
+        "protein-assembly",
+        "raman-fitting",
+        "tune-mjcf"
+      ]
+    },
+    "polyglot": {
+      "description": "Multi-language and protocol tasks (Rust+C, C+Python, gRPC)",
+      "tasks": [
+        "kv-store-grpc",
+        "polyglot-c-py",
+        "polyglot-rust-c"
+      ]
+    }
+  }
+}
