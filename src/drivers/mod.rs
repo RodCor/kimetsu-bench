@@ -6,5 +6,6 @@
 
 pub mod beam;
 pub mod brainbench;
+pub mod locomo;
 pub mod longmemeval;
 pub mod terminal_bench;

@@ -122,6 +122,11 @@ pub struct LongmemevalArgs {
     #[arg(long)]
     llm_base_url: Option<String>,
 
+    /// Instances to run concurrently (each has its own workspace + reader
+    /// calls). 0 = auto (KBENCH_PARALLEL env or 3). 1 = sequential.
+    #[arg(long, default_value_t = 0)]
+    parallel: usize,
+
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     output: OutputFormat,
@@ -206,6 +211,47 @@ enum KbenchCmd {
     /// Run the BEAM long-term-memory benchmark (rubric LLM-judge, 10 abilities).
     #[command(name = "beam")]
     Beam(BeamArgs),
+    /// Run the LoCoMo long-conversation memory benchmark (5 QA categories).
+    #[command(name = "locomo")]
+    Locomo(LocomoArgs),
+}
+
+/// Args for `kbench locomo` (github.com/snap-research/locomo).
+#[derive(Debug, Parser)]
+#[command(
+    name = "locomo",
+    about = "Run the LoCoMo long-conversation memory benchmark against Kimetsu.\n\
+             10 conversations, ~2,000 QA pairs across 5 categories (multi-hop,\n\
+             temporal, open-domain, single-hop, adversarial). Parallel by default.\n\
+             Dataset: curl -L -o locomo10.json https://raw.githubusercontent.com/\
+             snap-research/locomo/main/data/locomo10.json"
+)]
+pub struct LocomoArgs {
+    /// Path to locomo10.json.
+    #[arg(long)]
+    dataset: PathBuf,
+    /// Max questions (0 = all ~2,000). Sampled round-robin per category.
+    #[arg(long, default_value_t = 0)]
+    limit: usize,
+    /// Only these categories, comma-separated (1=multi-hop, 2=temporal,
+    /// 3=open-domain, 4=single-hop, 5=adversarial). Empty = all.
+    #[arg(long, value_delimiter = ',')]
+    categories: Vec<u8>,
+    /// Parse + plan only; no kimetsu or model calls.
+    #[arg(long)]
+    dry_run: bool,
+    /// Override the kimetsu binary path (default: KIMETSU_BIN env or `kimetsu`).
+    #[arg(long)]
+    kimetsu_binary: Option<PathBuf>,
+    /// LLM backend for answering + judging (`codex` or `claude`).
+    #[arg(long, default_value = "codex")]
+    reader_backend: String,
+    /// LLM model id (codex: `-m`; claude: `--model`).
+    #[arg(long)]
+    llm_model: Option<String>,
+    /// Questions to run concurrently. 0 = auto (KBENCH_PARALLEL or 3).
+    #[arg(long, default_value_t = 0)]
+    parallel: usize,
 }
 
 /// Args for `kbench beam` (github.com/mohammadtavakoli78/BEAM).
@@ -822,6 +868,7 @@ fn run_longmemeval_cmd(args: LongmemevalArgs, bench_dir: &Path) {
         llm_model: args.llm_model.clone(),
         llm_api_key: args.llm_api_key.clone(),
         llm_base_url: args.llm_base_url.clone(),
+        parallel: args.parallel,
     }
     .with_env_overlay();
 
@@ -955,6 +1002,57 @@ fn run_beam_cmd(args: BeamArgs, bench_dir: &Path) {
     }
 }
 
+fn run_locomo_cmd(args: LocomoArgs, bench_dir: &Path) {
+    use drivers::locomo::{LocomoConfig, render_markdown, run_locomo};
+
+    let backend = match drivers::longmemeval::LlmBackend::from_str(&args.reader_backend) {
+        Some(b) => b,
+        None => {
+            eprintln!(
+                "kbench locomo: unknown --reader-backend `{}`; expected `codex` or `claude`",
+                args.reader_backend
+            );
+            std::process::exit(1);
+        }
+    };
+    let cfg = LocomoConfig {
+        dataset_path: args.dataset.clone(),
+        limit: args.limit,
+        categories: args.categories.clone(),
+        dry_run: args.dry_run,
+        kimetsu_bin: args.kimetsu_binary.clone(),
+        llm_backend: backend,
+        llm_model: args.llm_model.clone(),
+        parallel: args.parallel,
+    };
+
+    let report = match run_locomo(&cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("kbench locomo: {e}");
+            std::process::exit(1);
+        }
+    };
+    let body = render_markdown(&report, &args.dataset);
+    println!("{body}");
+
+    let stamp = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "now".to_string())
+        .replace(':', "-");
+    let out_path = bench_dir
+        .join("local")
+        .join("runs")
+        .join("locomo")
+        .join(format!("{stamp}.md"));
+    if let Some(parent) = out_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&out_path, &body).is_ok() {
+        eprintln!("kbench locomo: report saved -> {}", out_path.display());
+    }
+}
+
 fn run_brainbench_cmd(args: BrainbenchArgs, bench_dir: &Path) {
     use drivers::brainbench::synthetic_fixture;
 
@@ -1065,6 +1163,10 @@ fn main() {
             }
             KbenchCmd::Beam(args) => {
                 run_beam_cmd(args, &bench_dir);
+                return;
+            }
+            KbenchCmd::Locomo(args) => {
+                run_locomo_cmd(args, &bench_dir);
                 return;
             }
         }

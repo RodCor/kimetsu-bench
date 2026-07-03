@@ -82,12 +82,33 @@ function prefixDate(content, date) {
   return date ? `[${date}] ${c}` : c;
 }
 
+// Normalize the two chat.json shapes into a flat list of batches:
+//   - 100K/1M:  [ {batch_number, turns}, ... ]                     (batches at top)
+//   - 10M:      [ {"plan-1": [ {batch_number, turns}, ... ]}, ...] (grouped by plan)
+// A "batch" is any object that has a `turns` field; anything else is treated as
+// a container whose (array) values hold batches.
+function collectBatches(chatJson) {
+  const batches = [];
+  if (!Array.isArray(chatJson)) return batches;
+  for (const item of chatJson) {
+    if (item && Array.isArray(item.turns)) {
+      batches.push(item);
+    } else if (item && typeof item === "object") {
+      for (const v of Object.values(item)) {
+        if (Array.isArray(v)) {
+          for (const b of v) if (b && Array.isArray(b.turns)) batches.push(b);
+        }
+      }
+    }
+  }
+  return batches;
+}
+
 // Flatten chat.json batches -> turns -> messages into [{role, content}],
 // baking the (message|batch) time_anchor into the content.
 function flattenChat(chatJson) {
   const out = [];
-  if (!Array.isArray(chatJson)) return out;
-  for (const batch of chatJson) {
+  for (const batch of collectBatches(chatJson)) {
     const batchDate = batch && batch.time_anchor;
     const turns = (batch && batch.turns) || [];
     for (const turn of turns) {
