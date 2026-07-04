@@ -463,7 +463,10 @@ fn judge(
                 && !verdict.to_uppercase().contains("INCORRECT"))
         }
         LlmBackend::Claude => {
-            let verdict = claude_call(&judge_prompt(question, rubric, predicted), cfg.llm_model.as_deref())?;
+            let verdict = claude_call(
+                &judge_prompt(question, rubric, predicted),
+                cfg.llm_model.as_deref(),
+            )?;
             Ok(verdict.to_uppercase().contains("CORRECT")
                 && !verdict.to_uppercase().contains("INCORRECT"))
         }

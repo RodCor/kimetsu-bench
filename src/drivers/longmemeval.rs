@@ -566,7 +566,9 @@ pub fn require_embeddings_build(kimetsu_bin: &str) -> Result<(), LmeError> {
     let out = Command::new(kimetsu_bin)
         .arg("--version")
         .output()
-        .map_err(|e| LmeError::KimetsuError(format!("could not run `{kimetsu_bin} --version`: {e}")))?;
+        .map_err(|e| {
+            LmeError::KimetsuError(format!("could not run `{kimetsu_bin} --version`: {e}"))
+        })?;
     let version = String::from_utf8_lossy(&out.stdout);
     if version.contains("(embeddings)") {
         return Ok(());
@@ -1075,7 +1077,9 @@ pub fn claude_call(prompt: &str, model: Option<&str>) -> Result<String, LmeError
         .map_err(|e| LmeError::LlmError(format!("claude -p output read failed: {e}")))?;
     let answer = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if answer.is_empty() {
-        return Err(LmeError::LlmError("claude -p returned an empty answer".to_string()));
+        return Err(LmeError::LlmError(
+            "claude -p returned an empty answer".to_string(),
+        ));
     }
     Ok(answer)
 }

@@ -252,6 +252,18 @@ pub struct LocomoArgs {
     /// Questions to run concurrently. 0 = auto (KBENCH_PARALLEL or 3).
     #[arg(long, default_value_t = 0)]
     parallel: usize,
+    /// Run the question set N times against the SAME brains (learning curve).
+    #[arg(long, default_value_t = 1)]
+    iterations: usize,
+    /// Between iterations, cite the top memories of correctly-answered TRAIN
+    /// questions and self-tune retrieval (`brain tune --apply`). The holdout
+    /// half never produces feedback, so its curve shows generalization.
+    #[arg(long)]
+    learn: bool,
+    /// Persistent per-sample workspace root (brains survive across iterations
+    /// and restarts; ingest skipped when a brain exists). Default: temp dirs.
+    #[arg(long)]
+    workspace_root: Option<PathBuf>,
 }
 
 /// Args for `kbench beam` (github.com/mohammadtavakoli78/BEAM).
@@ -1024,6 +1036,9 @@ fn run_locomo_cmd(args: LocomoArgs, bench_dir: &Path) {
         llm_backend: backend,
         llm_model: args.llm_model.clone(),
         parallel: args.parallel,
+        iterations: args.iterations,
+        learn: args.learn,
+        workspace_root: args.workspace_root.clone(),
     };
 
     let report = match run_locomo(&cfg) {
