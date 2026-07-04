@@ -804,6 +804,15 @@ fn answer_one(
             }
         }
         Err(e) => {
+            // Infra death is NOT a grading problem: a quota-exhausted judge
+            // must surface as a question-level error (visible, retryable,
+            // gated) — the heuristic fallback exists only for judges that
+            // answered but unparseably. Falling back on quota death silently
+            // deflated iteration 4 of the v3 learning run by ~7 points.
+            let msg = e.to_string();
+            if msg.contains("usage limit") {
+                return Err(e);
+            }
             eprintln!("    [judge] warn: {e} — heuristic fallback");
             heuristic_judge(&predicted, &gold, is_abstention)
         }

@@ -1289,6 +1289,10 @@ fn judge_answer(
                     };
                     (score, format!("codex judge: {}", reply.trim()))
                 }
+                Err(e) if e.to_string().contains("usage limit") => (
+                    0.0,
+                    format!("ERROR (counted incorrect): judge quota death: {e}"),
+                ),
                 Err(e) => {
                     eprintln!("    [codex judge] warn: {e} — falling back to heuristic");
                     (
@@ -1311,6 +1315,10 @@ fn judge_answer(
                     };
                     (score, format!("claude judge: {}", reply.trim()))
                 }
+                Err(e) if e.to_string().contains("usage limit") => (
+                    0.0,
+                    format!("ERROR (counted incorrect): judge quota death: {e}"),
+                ),
                 Err(e) => {
                     eprintln!("    [claude judge] warn: {e} — falling back to heuristic");
                     (
