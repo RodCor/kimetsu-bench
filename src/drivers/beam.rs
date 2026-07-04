@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 // Reuse the LongMemEval LLM machinery: codex backend, error type, retrieval
 // budget. `codex_call` / `LlmBackend` / `LmeError` are all public there.
-use super::longmemeval::{LlmBackend, LmeError, codex_call};
+use super::longmemeval::{LlmBackend, LmeError, claude_call, codex_call};
 
 /// One conversation turn.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -274,6 +274,17 @@ fn setup_and_ingest(conv: &BeamConversation, kimetsu_bin: &str) -> Result<Worksp
         )));
     }
 
+    // Retrieval backend. Default graph-lite; override via KBENCH_BEAM_BACKEND
+    // (e.g. "flat") to A/B graph-lite vs flat on the same data. graph-lite
+    // follows model-free `relates_to` edges (built below) for multi-hop recall,
+    // scored by hop-decayed seed relevance (levers 2/3 in the engine).
+    let backend = std::env::var("KBENCH_BEAM_BACKEND").unwrap_or_else(|_| "graph-lite".into());
+    let _ = Command::new(kimetsu_bin)
+        .current_dir(ws)
+        .args(["config", "set", "storage.backend", &backend])
+        .output();
+    let use_graph = backend == "graph-lite";
+
     // One memory per turn (role-prefixed), ingested in a single add-batch.
     let entries: Vec<String> = conv
         .chat
@@ -296,8 +307,13 @@ fn setup_and_ingest(conv: &BeamConversation, kimetsu_bin: &str) -> Result<Worksp
     let batch = ws.join("beam-batch.jsonl");
     std::fs::write(&batch, entries.join("\n"))
         .map_err(|e| LmeError::KimetsuError(format!("write batch: {e}")))?;
+    // Supersession on ingest: detect + resolve contradictions so an updated
+    // fact collapses to its current value (targets knowledge_update). Needs the
+    // embedder (this run uses jina) for the cosine neighbour scan.
     let out = Command::new(kimetsu_bin)
         .current_dir(ws)
+        .env("KIMETSU_DETECT_CONFLICTS", "1")
+        .env("KIMETSU_RESOLVE_CONFLICTS", "1")
         .args(["brain", "memory", "add-batch"])
         .arg(&batch)
         .output()
@@ -309,6 +325,17 @@ fn setup_and_ingest(conv: &BeamConversation, kimetsu_bin: &str) -> Result<Worksp
             String::from_utf8_lossy(&out.stderr)
         )));
     }
+
+    // Build the model-free `relates_to` entity graph over the ingested memories
+    // (shared proper nouns / salient terms) so graph-lite retrieval has edges to
+    // traverse. Only when graph-lite is active. Rule-based only (no model).
+    if use_graph {
+        let _ = Command::new(kimetsu_bin)
+            .current_dir(ws)
+            .args(["brain", "graph", "build"])
+            .output();
+    }
+
     Ok(Workspace { tmp })
 }
 
@@ -406,10 +433,14 @@ fn answer(
         LlmBackend::Codex => codex_call(
             &reader_prompt(category, question, context),
             cfg.llm_model.as_deref(),
-            Some("high"),
+            Some(&super::longmemeval::reader_effort()),
+        ),
+        LlmBackend::Claude => claude_call(
+            &reader_prompt(category, question, context),
+            cfg.llm_model.as_deref(),
         ),
         LlmBackend::Http => Err(LmeError::LlmError(
-            "BEAM driver currently supports the codex backend only (--reader-backend codex)"
+            "BEAM driver supports the codex or claude backend (--reader-backend codex|claude)"
                 .to_string(),
         )),
     }
@@ -431,8 +462,16 @@ fn judge(
             Ok(verdict.to_uppercase().contains("CORRECT")
                 && !verdict.to_uppercase().contains("INCORRECT"))
         }
+        LlmBackend::Claude => {
+            let verdict = claude_call(
+                &judge_prompt(question, rubric, predicted),
+                cfg.llm_model.as_deref(),
+            )?;
+            Ok(verdict.to_uppercase().contains("CORRECT")
+                && !verdict.to_uppercase().contains("INCORRECT"))
+        }
         LlmBackend::Http => Err(LmeError::LlmError(
-            "BEAM driver currently supports the codex backend only".to_string(),
+            "BEAM driver supports the codex or claude backend".to_string(),
         )),
     }
 }
@@ -472,6 +511,7 @@ pub fn run_beam(
     conversations: Vec<BeamConversation>,
 ) -> Result<BeamReport, LmeError> {
     let kimetsu_bin = cfg.resolve_bin();
+    super::longmemeval::require_embeddings_build(&kimetsu_bin)?;
 
     // Filter categories + limit.
     let mut convs = conversations;

@@ -198,6 +198,10 @@ pub enum LlmBackend {
     #[default]
     Http,
     Codex,
+    /// `claude -p` CLI (Claude Code, uses the local login — no API key). A
+    /// non-abstaining reader; also lets us match a competitor's reader (e.g.
+    /// Haiku 4.5, which Honcho uses) for an apples-to-apples LongMemEval.
+    Claude,
 }
 
 impl LlmBackend {
@@ -205,6 +209,7 @@ impl LlmBackend {
         match s.to_lowercase().as_str() {
             "http" => Some(Self::Http),
             "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
             _ => None,
         }
     }
@@ -213,6 +218,7 @@ impl LlmBackend {
         match self {
             Self::Http => "http",
             Self::Codex => "codex",
+            Self::Claude => "claude",
         }
     }
 }
@@ -241,6 +247,10 @@ pub struct LmeConfig {
     pub llm_api_key: Option<String>,
     /// Base URL for the LLM provider API (http backend only).
     pub llm_base_url: Option<String>,
+    /// Worker-pool size: how many instances run concurrently. Instances are
+    /// independent (own workspace + reader subprocess), so this is a pure
+    /// wall-clock lever. 1 = sequential (pre-parallel behaviour).
+    pub parallel: usize,
 }
 
 impl LmeConfig {
@@ -261,6 +271,12 @@ impl LmeConfig {
         }
         if self.llm_base_url.is_none() {
             self.llm_base_url = std::env::var("KBENCH_LLM_BASE_URL").ok();
+        }
+        if self.parallel == 0 {
+            self.parallel = std::env::var("KBENCH_PARALLEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3);
         }
         if self.kimetsu_bin.is_none()
             && let Ok(v) = std::env::var("KIMETSU_BIN")
@@ -301,6 +317,10 @@ impl LmeConfig {
             }
             LlmBackend::Codex => {
                 // codex auth is validated at first call; nothing to check here.
+                Ok(())
+            }
+            LlmBackend::Claude => {
+                // claude login validated at first call; nothing to check here.
                 Ok(())
             }
         }
@@ -531,6 +551,38 @@ fn resolve_kimetsu_bin(cfg: &LmeConfig) -> String {
     "kimetsu".to_string()
 }
 
+/// Refuse to benchmark a LEAN kimetsu build. `kimetsu-cli` ships `default = []`,
+/// so a plain `cargo build --release` silently strips the embedder + reranker and
+/// retrieval degrades to FTS-only — scores crater (~79% → ~45% on LongMemEval)
+/// with zero warnings. This burned a full night of runs and two wrong root-cause
+/// calls, so the harness now checks `kimetsu --version` for the `(embeddings)`
+/// marker up front. Escape hatch: `KBENCH_ALLOW_LEAN=1` (e.g. to measure the
+/// FTS-only floor on purpose).
+pub fn require_embeddings_build(kimetsu_bin: &str) -> Result<(), LmeError> {
+    if std::env::var("KBENCH_ALLOW_LEAN").is_ok_and(|v| v == "1") {
+        eprintln!("  [guard] KBENCH_ALLOW_LEAN=1 — skipping the embeddings-build check");
+        return Ok(());
+    }
+    let out = Command::new(kimetsu_bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            LmeError::KimetsuError(format!("could not run `{kimetsu_bin} --version`: {e}"))
+        })?;
+    let version = String::from_utf8_lossy(&out.stdout);
+    if version.contains("(embeddings)") {
+        return Ok(());
+    }
+    Err(LmeError::KimetsuError(format!(
+        "kimetsu binary `{kimetsu_bin}` is a LEAN build ({}). Benchmarks on a lean \
+         build are invalid: retrieval silently falls back to FTS-only (no embedder, \
+         no reranker) and scores crater. Rebuild with \
+         `cargo build --release --bin kimetsu --features embeddings`, or set \
+         KBENCH_ALLOW_LEAN=1 to measure the FTS-only floor deliberately.",
+        version.trim()
+    )))
+}
+
 /// Result of a per-instance ingest: the live temp workspace plus the number of
 /// memory-add subprocess calls performed (one per ingested turn). The count is
 /// reported so we can estimate full-run cost (per-turn ingest is many more
@@ -595,6 +647,17 @@ fn ingest_sessions(instance: &LmeInstance, kimetsu_bin: &str) -> Result<IngestOu
         )));
     }
 
+    // v2.5 graph-ranking: OPT-IN via KBENCH_LME_GRAPH=1. Default is flat (the
+    // 79.5% baseline). graph-lite under-retrieves at LongMemEval scale (starves
+    // the reader on global-aggregation questions), so it is off by default here.
+    let use_graph = std::env::var("KBENCH_LME_GRAPH").is_ok_and(|v| v == "1");
+    if use_graph {
+        let _ = Command::new(kimetsu_bin)
+            .current_dir(workspace)
+            .args(["config", "set", "storage.backend", "graph-lite"])
+            .output();
+    }
+
     // One memory per TURN, but ingested via a SINGLE `add-batch` call (one
     // process, embedder loaded once) instead of a subprocess per turn — turns
     // ~13 min/instance of process-spawn overhead into seconds.
@@ -654,6 +717,15 @@ fn ingest_sessions(instance: &LmeInstance, kimetsu_bin: &str) -> Result<IngestOu
             "memory add-batch failed for instance {}: {stderr}",
             instance.question_id
         )));
+    }
+
+    // v2.5 graph-ranking: build the entity graph only when graph-lite is enabled
+    // (KBENCH_LME_GRAPH=1). Rule-based, model-free.
+    if use_graph {
+        let _ = Command::new(kimetsu_bin)
+            .current_dir(workspace)
+            .args(["brain", "graph", "build"])
+            .output();
     }
 
     Ok(IngestOutcome {
@@ -718,8 +790,17 @@ fn capitalize_role(role: &str) -> &str {
 
 // ─── Codex backend ───────────────────────────────────────────────────────────
 
-/// Per-call timeout for codex exec (seconds).
-const CODEX_TIMEOUT_SECS: u64 = 120;
+/// Per-call reader/judge timeout in seconds. 120s was enough for a sequential
+/// 48k-context call, but parallel workers slow each other down and 96k-context
+/// BEAM calls run longer; a timed-out probe is counted incorrect, so an
+/// under-sized timeout silently deflates scores (it cost a full BEAM run ~20%
+/// of its probes). Generous default, env-tunable per run.
+fn llm_timeout_secs() -> u64 {
+    std::env::var("KBENCH_LLM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+}
 
 /// Call `codex exec` with the verified flags.
 ///
@@ -731,6 +812,13 @@ const CODEX_TIMEOUT_SECS: u64 = 120;
 /// parsing needed.  Returns the content of that file on success.
 ///
 /// On timeout or non-zero exit, returns an `Err(LmeError::LlmError)`.
+/// Reader reasoning effort. Defaults to `xhigh` (steadier answers on the hard
+/// aggregation/temporal questions); override with `KBENCH_LLM_EFFORT` (e.g.
+/// `high`, `medium`). Judges stay light — they only classify CORRECT/INCORRECT.
+pub fn reader_effort() -> String {
+    std::env::var("KBENCH_LLM_EFFORT").unwrap_or_else(|_| "xhigh".to_string())
+}
+
 pub fn codex_call(
     prompt: &str,
     model: Option<&str>,
@@ -835,7 +923,8 @@ pub fn codex_call(
 
     // Poll with a timeout.  std::process::Command has no built-in timeout;
     // we use try_wait in a sleep loop and kill on expiry.
-    let timeout = std::time::Duration::from_secs(CODEX_TIMEOUT_SECS);
+    let timeout_secs = llm_timeout_secs();
+    let timeout = std::time::Duration::from_secs(timeout_secs);
     let start = std::time::Instant::now();
 
     loop {
@@ -860,7 +949,7 @@ pub fn codex_call(
                     let _ = child.wait();
                     return Err(LmeError::LlmError(format!(
                         "codex exec timed out after {}s",
-                        CODEX_TIMEOUT_SECS
+                        timeout_secs
                     )));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -889,6 +978,110 @@ pub fn codex_call(
 
     // tmp_dir dropped here — temp dir cleaned up automatically.
     Ok(trimmed)
+}
+
+/// Reader/judge via the `claude -p` CLI (Claude Code local login, no API key).
+/// Prints the response to stdout; we capture and trim it. Isolated with an empty
+/// MCP config and no-op hooks so benchmark calls neither load the kimetsu MCP nor
+/// fire session hooks (the harvester must not ingest benchmark text). `model` is
+/// e.g. `claude-haiku-4-5` or `claude-opus-4-8`.
+pub fn claude_call(prompt: &str, model: Option<&str>) -> Result<String, LmeError> {
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("kbench-claude-")
+        .tempdir()
+        .map_err(|e| LmeError::Other(format!("could not create claude temp dir: {e}")))?;
+    // Empty MCP + hook-free settings for a clean, fast, side-effect-free reader.
+    let mcp_file = tmp_dir.path().join("mcp.json");
+    std::fs::write(&mcp_file, "{\"mcpServers\":{}}").ok();
+    let settings_file = tmp_dir.path().join("settings.json");
+    std::fs::write(&settings_file, "{\"hooks\":{}}").ok();
+
+    let mut argv: Vec<String> = vec![
+        "-p".to_string(),
+        "--output-format".to_string(),
+        "text".to_string(),
+        "--strict-mcp-config".to_string(),
+        "--mcp-config".to_string(),
+        mcp_file.to_string_lossy().to_string(),
+        "--settings".to_string(),
+        settings_file.to_string_lossy().to_string(),
+    ];
+    if let Some(m) = model
+        && !m.is_empty()
+    {
+        argv.push("--model".to_string());
+        argv.push(m.to_string());
+    }
+
+    eprintln!(
+        "    [claude] claude -p --model {} (mcp/hooks isolated)",
+        model.unwrap_or("<default>")
+    );
+
+    // claude.exe is a native executable on Windows — invoke directly.
+    let mut cmd = Command::new("claude");
+    cmd.args(&argv)
+        .current_dir(tmp_dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        LmeError::LlmError(format!(
+            "could not spawn `claude -p`: {e} (is `claude` on PATH and logged in?)"
+        ))
+    })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let prompt_bytes = prompt.as_bytes().to_vec();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&prompt_bytes);
+        });
+    }
+
+    // Timeout via try_wait loop (claude reasoning + reader context can be slow).
+    let timeout_secs = llm_timeout_secs();
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    let code = status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".to_string());
+                    return Err(LmeError::LlmError(format!(
+                        "claude -p exited with code {code}"
+                    )));
+                }
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(LmeError::LlmError(format!(
+                        "claude -p timed out after {timeout_secs}s"
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => return Err(LmeError::LlmError(format!("claude -p wait failed: {e}"))),
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| LmeError::LlmError(format!("claude -p output read failed: {e}")))?;
+    let answer = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if answer.is_empty() {
+        return Err(LmeError::LlmError(
+            "claude -p returned an empty answer".to_string(),
+        ));
+    }
+    Ok(answer)
 }
 
 // ─── LLM calls (OpenAI-compatible) ──────────────────────────────────────────
@@ -933,7 +1126,7 @@ fn llm_chat(
 
 /// Build the reader prompt (combined system+user) for the codex backend.
 /// The codex exec takes a single prompt string, not system+user separately.
-fn codex_reader_prompt(question: &str, context: &str, question_date: &str) -> String {
+pub(crate) fn codex_reader_prompt(question: &str, context: &str, question_date: &str) -> String {
     let date_line = if question_date.trim().is_empty() {
         String::new()
     } else {
@@ -957,7 +1150,7 @@ fn codex_reader_prompt(question: &str, context: &str, question_date: &str) -> St
 }
 
 /// Build the judge prompt for the codex backend.
-fn codex_judge_prompt(
+pub(crate) fn codex_judge_prompt(
     question: &str,
     gold: &str,
     predicted: &str,
@@ -1003,9 +1196,14 @@ fn answer_question(
     match cfg.llm_backend {
         LlmBackend::Codex => {
             let prompt = codex_reader_prompt(question, context, question_date);
-            // Reader runs at high reasoning effort: it must do date arithmetic and
-            // cross-session counting, which collapse at the default "none".
-            codex_call(&prompt, cfg.llm_model.as_deref(), Some("high"))
+            // Reader runs at high reasoning effort (default xhigh): it must do date
+            // arithmetic and cross-session counting, which collapse at "none".
+            codex_call(&prompt, cfg.llm_model.as_deref(), Some(&reader_effort()))
+        }
+        LlmBackend::Claude => {
+            // Same reader prompt; claude -p answers instead of over-abstaining.
+            let prompt = codex_reader_prompt(question, context, question_date);
+            claude_call(&prompt, cfg.llm_model.as_deref())
         }
         LlmBackend::Http => {
             let (model, api_key) = cfg.require_http_llm()?;
@@ -1065,6 +1263,28 @@ fn judge_answer(
                     (
                         heuristic_score,
                         format!("heuristic fallback (codex judge failed: {e})"),
+                    )
+                }
+            }
+        }
+        LlmBackend::Claude => {
+            // Claude backend: judge with claude -p too (consistent, non-degraded).
+            let prompt = codex_judge_prompt(question, gold, predicted, is_abstention, base_type);
+            match claude_call(&prompt, cfg.llm_model.as_deref()) {
+                Ok(reply) => {
+                    let reply_up = reply.trim().to_uppercase();
+                    let score = if reply_up.contains("CORRECT") && !reply_up.contains("INCORRECT") {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    (score, format!("claude judge: {}", reply.trim()))
+                }
+                Err(e) => {
+                    eprintln!("    [claude judge] warn: {e} — falling back to heuristic");
+                    (
+                        heuristic_score,
+                        format!("heuristic fallback (claude judge failed: {e})"),
                     )
                 }
             }
@@ -1129,7 +1349,7 @@ fn llm_judge(
 }
 
 /// Heuristic judge: substring match with some normalization.
-fn heuristic_judge(predicted: &str, gold: &str, is_abstention: bool) -> f32 {
+pub(crate) fn heuristic_judge(predicted: &str, gold: &str, is_abstention: bool) -> f32 {
     let pred_low = predicted.to_lowercase();
     let gold_low = gold.to_lowercase();
 
@@ -1217,6 +1437,7 @@ pub fn run_longmemeval(cfg: &LmeConfig) -> Result<LmeReport, LmeError> {
     cfg.validate_llm_config()?;
 
     let kimetsu_bin = resolve_kimetsu_bin(cfg);
+    require_embeddings_build(&kimetsu_bin)?;
     run_real(instances, cfg, &kimetsu_bin)
 }
 
@@ -1265,48 +1486,90 @@ fn run_real(
     cfg: &LmeConfig,
     kimetsu_bin: &str,
 ) -> Result<LmeReport, LmeError> {
-    let mut results: Vec<LmeInstanceResult> = Vec::new();
-
-    for (i, inst) in instances.iter().enumerate() {
-        let start = std::time::Instant::now();
-        eprintln!(
-            "  [{}/{}] {} | type={} ...",
-            i + 1,
-            instances.len(),
-            inst.question_id,
-            inst.question_type
-        );
-
-        let result = run_single_instance(inst, cfg, kimetsu_bin);
-        let duration_secs = start.elapsed().as_secs_f64();
-
-        match result {
-            Ok((predicted, score, judge_reason)) => {
-                eprintln!("    -> score={score:.0} judge={judge_reason}");
-                results.push(LmeInstanceResult {
-                    question_id: inst.question_id.clone(),
-                    question_type: inst.question_type.clone(),
-                    predicted,
-                    gold: inst.answer.clone(),
-                    score,
-                    judge_reason,
-                    duration_secs,
-                });
-            }
-            Err(e) => {
-                eprintln!("    -> ERROR (counted as incorrect): {e}");
-                results.push(LmeInstanceResult {
-                    question_id: inst.question_id.clone(),
-                    question_type: inst.question_type.clone(),
-                    predicted: format!("[error: {e}]"),
-                    gold: inst.answer.clone(),
-                    score: 0.0,
-                    judge_reason: format!("error: {e}"),
-                    duration_secs,
-                });
-            }
-        }
+    let total = instances.len();
+    let workers = cfg.parallel.max(1).min(total.max(1));
+    if workers > 1 {
+        eprintln!("longmemeval: running with {workers} parallel workers");
     }
+
+    // Instances are fully independent (each gets its own temp workspace, its
+    // own brain, and its own reader/judge subprocess calls), so a worker pool
+    // parallelizes cleanly. Results are written back by index, so the report
+    // is identical to a sequential run regardless of completion order.
+    let instances = std::sync::Arc::new(instances);
+    let slots: std::sync::Arc<std::sync::Mutex<Vec<Option<LmeInstanceResult>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new((0..total).map(|_| None).collect()));
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let instances = instances.clone();
+            let slots = slots.clone();
+            let next = next.clone();
+            let cfg = cfg.clone();
+            let kimetsu_bin = kimetsu_bin.to_string();
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if i >= total {
+                        break;
+                    }
+                    let inst = &instances[i];
+                    let start = std::time::Instant::now();
+                    eprintln!(
+                        "  [{}/{}] {} | type={} ...",
+                        i + 1,
+                        total,
+                        inst.question_id,
+                        inst.question_type
+                    );
+                    let result = run_single_instance(inst, &cfg, &kimetsu_bin);
+                    let duration_secs = start.elapsed().as_secs_f64();
+                    let entry = match result {
+                        Ok((predicted, score, judge_reason)) => {
+                            eprintln!(
+                                "    -> [{}] score={score:.0} judge={judge_reason}",
+                                inst.question_id
+                            );
+                            LmeInstanceResult {
+                                question_id: inst.question_id.clone(),
+                                question_type: inst.question_type.clone(),
+                                predicted,
+                                gold: inst.answer.clone(),
+                                score,
+                                judge_reason,
+                                duration_secs,
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "    -> [{}] ERROR (counted as incorrect): {e}",
+                                inst.question_id
+                            );
+                            LmeInstanceResult {
+                                question_id: inst.question_id.clone(),
+                                question_type: inst.question_type.clone(),
+                                predicted: format!("[error: {e}]"),
+                                gold: inst.answer.clone(),
+                                score: 0.0,
+                                judge_reason: format!("error: {e}"),
+                                duration_secs,
+                            }
+                        }
+                    };
+                    slots.lock().unwrap()[i] = Some(entry);
+                }
+            });
+        }
+    });
+
+    let results: Vec<LmeInstanceResult> = std::sync::Arc::try_unwrap(slots)
+        .expect("workers joined")
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect();
 
     Ok(build_report(results, &cfg.dataset_path))
 }
@@ -1795,6 +2058,7 @@ mod tests {
             llm_model: None,
             llm_api_key: None,
             llm_base_url: None,
+            parallel: 1,
         }
     }
 
@@ -1920,6 +2184,7 @@ mod tests {
             llm_model: None,
             llm_api_key: None,
             llm_base_url: None,
+            parallel: 1,
         };
 
         let report = run_longmemeval(&cfg).expect("dry-run should not error");
@@ -1974,6 +2239,7 @@ mod tests {
             llm_model: None,
             llm_api_key: None,
             llm_base_url: None,
+            parallel: 1,
         };
 
         // Codex dry-run must not error (no codex calls).
@@ -1996,6 +2262,7 @@ mod tests {
             llm_model: None,
             llm_api_key: None,
             llm_base_url: None,
+            parallel: 1,
         };
         let err = cfg.require_llm().unwrap_err();
         let msg = err.to_string();
@@ -2021,6 +2288,7 @@ mod tests {
             llm_model: None,
             llm_api_key: None,
             llm_base_url: None,
+            parallel: 1,
         };
         // Codex backend: no API key required — validate_llm_config() must not error.
         assert!(

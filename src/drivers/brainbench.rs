@@ -2116,6 +2116,10 @@ pub fn run_brainbench(cfg: &BrainBenchConfig) -> Result<BrainBenchReport, BrainB
     eprintln!("brainbench: {} scenario(s) to run", scenarios.len());
 
     let kimetsu_bin = resolve_kimetsu_bin(cfg);
+    // Reader-free but NOT embedder-free: retrieval + dedup scenarios need the
+    // semantic path, so a lean build silently deflates the quality index too.
+    super::longmemeval::require_embeddings_build(&kimetsu_bin)
+        .map_err(|e| BrainBenchError::Other(e.to_string()))?;
 
     let mut results: Vec<ScenarioResult> = Vec::new();
     for (i, scenario) in scenarios.iter().enumerate() {
