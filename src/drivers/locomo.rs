@@ -450,6 +450,16 @@ pub fn run_locomo(cfg: &LocomoConfig) -> Result<LocomoReport, LmeError> {
     for iter in 1..=iterations {
         if iterations > 1 {
             eprintln!("locomo: ── iteration {iter}/{iterations} ──");
+            // Quota gate: a k-run makes thousands of reader calls and the
+            // codex window WILL die mid-run. Waiting here (instead of
+            // grinding a dead reader) is what keeps every iteration's
+            // numbers valid — two k=5 runs were tail-poisoned before this.
+            if matches!(cfg.llm_backend, LlmBackend::Codex)
+                && !super::longmemeval::wait_for_codex(cfg.llm_model.as_deref(), 8)
+            {
+                eprintln!("locomo: codex never recovered; stopping before iteration {iter}");
+                break;
+            }
         }
         let results: Arc<Mutex<Vec<Option<LocomoResult>>>> =
             Arc::new(Mutex::new((0..total).map(|_| None).collect()));

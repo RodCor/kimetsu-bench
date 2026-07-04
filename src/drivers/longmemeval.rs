@@ -976,8 +976,39 @@ pub fn codex_call(
         ));
     }
 
+    // Quota exhaustion is NOT an answer: codex prints the ChatGPT usage-limit
+    // message with EXIT 0, which silently poisoned two k=5 learning runs
+    // (every verdict counted INCORRECT, zero error rows, score floored at the
+    // abstention-credit fraction). Surface it as an error so error counting,
+    // retries, and quota gates all see it.
+    if trimmed.contains("hit your usage limit") {
+        return Err(LmeError::LlmError(format!(
+            "codex usage limit hit (quota window exhausted): {}",
+            trimmed.lines().next().unwrap_or_default()
+        )));
+    }
+
     // tmp_dir dropped here — temp dir cleaned up automatically.
     Ok(trimmed)
+}
+
+/// Block until codex answers a trivial probe (quota window alive). Checks every
+/// 10 minutes for up to `max_hours`. Returns false if it never recovered.
+pub fn wait_for_codex(model: Option<&str>, max_hours: u32) -> bool {
+    let checks = max_hours * 6;
+    for i in 0..checks.max(1) {
+        match codex_call("reply with exactly: OK", model, None) {
+            Ok(a) if a.contains("OK") => return true,
+            _ => {}
+        }
+        eprintln!(
+            "  [quota] codex unavailable; waiting 10min (check {}/{})",
+            i + 1,
+            checks
+        );
+        std::thread::sleep(std::time::Duration::from_secs(600));
+    }
+    false
 }
 
 /// Reader/judge via the `claude -p` CLI (Claude Code local login, no API key).
