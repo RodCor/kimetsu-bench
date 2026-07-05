@@ -885,6 +885,43 @@ fn ingest_sample(
     Ok(holder)
 }
 
+/// Reader/judge call with quota resilience: on usage-limit death, park on
+/// the liveness probe (10-min checks, up to 8h) and retry the SAME call.
+/// This is what lets a single multi-thousand-call pass survive window
+/// resets without poisoning any question.
+fn call_with_quota_retry(
+    cfg: &LocomoConfig,
+    prompt: &str,
+    effort: Option<&str>,
+) -> Result<String, LmeError> {
+    for attempt in 0..3 {
+        let result = match cfg.llm_backend {
+            LlmBackend::Codex => codex_call(prompt, cfg.llm_model.as_deref(), effort),
+            LlmBackend::Claude => claude_call(prompt, cfg.llm_model.as_deref()),
+            LlmBackend::Http => {
+                return Err(LmeError::LlmError(
+                    "locomo supports --reader-backend codex|claude".to_string(),
+                ));
+            }
+        };
+        match result {
+            Err(e)
+                if e.to_string().contains("usage limit")
+                    && matches!(cfg.llm_backend, LlmBackend::Codex)
+                    && attempt < 2 =>
+            {
+                eprintln!("    [quota] mid-run usage limit; parking until the window resets");
+                if !super::longmemeval::wait_for_codex(cfg.llm_model.as_deref(), 8) {
+                    return Err(e);
+                }
+                continue;
+            }
+            other => return other,
+        }
+    }
+    unreachable!("loop always returns")
+}
+
 fn answer_one(
     item: &WorkItem,
     sample: &LocomoSample,
@@ -945,15 +982,7 @@ fn answer_one(
              exactly: CITED: none",
         );
     }
-    let raw_predicted = match cfg.llm_backend {
-        LlmBackend::Codex => codex_call(&prompt, cfg.llm_model.as_deref(), Some(&reader_effort()))?,
-        LlmBackend::Claude => claude_call(&prompt, cfg.llm_model.as_deref())?,
-        LlmBackend::Http => {
-            return Err(LmeError::LlmError(
-                "locomo supports --reader-backend codex|claude".to_string(),
-            ));
-        }
-    };
+    let raw_predicted = call_with_quota_retry(cfg, &prompt, Some(&reader_effort()))?;
     // Split the CITED line off so the judge never sees it.
     let (predicted, self_cited_ids) = if cfg.self_cite {
         match raw_predicted.rsplit_once("CITED:") {
@@ -982,11 +1011,7 @@ fn answer_one(
             category_name(item.qa.category),
         )
     };
-    let verdict = match cfg.llm_backend {
-        LlmBackend::Codex => codex_call(&judge_prompt, cfg.llm_model.as_deref(), None),
-        LlmBackend::Claude => claude_call(&judge_prompt, cfg.llm_model.as_deref()),
-        LlmBackend::Http => unreachable!(),
-    };
+    let verdict = call_with_quota_retry(cfg, &judge_prompt, None);
     let score = match verdict {
         Ok(reply) => {
             let up = reply.to_uppercase();
