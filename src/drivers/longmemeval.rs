@@ -983,15 +983,13 @@ pub fn codex_call(
     // Quota check on STDERR before trusting the answer file: codex reports
     // the usage limit there with exit 0, sometimes leaving a stale/partial
     // answer file that would grade as an ordinary wrong answer.
-    if let Some(handle) = stderr_handle {
-        if let Ok(stderr_text) = handle.join() {
-            if stderr_text.contains("hit your usage limit") {
-                return Err(LmeError::LlmError(
-                    "codex usage limit hit (reported on stderr; quota window exhausted)"
-                        .to_string(),
-                ));
-            }
-        }
+    if let Some(handle) = stderr_handle
+        && let Ok(stderr_text) = handle.join()
+        && stderr_text.contains("hit your usage limit")
+    {
+        return Err(LmeError::LlmError(
+            "codex usage limit hit (reported on stderr; quota window exhausted)".to_string(),
+        ));
     }
 
     let answer = std::fs::read_to_string(&answer_file).map_err(|e| {
