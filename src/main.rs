@@ -264,6 +264,10 @@ pub struct LocomoArgs {
     /// and restarts; ingest skipped when a brain exists). Default: temp dirs.
     #[arg(long)]
     workspace_root: Option<PathBuf>,
+    /// Full-power learning: the reader reports which memories it used
+    /// (CITED: line) instead of the harness citing top-k retrieved.
+    #[arg(long)]
+    self_cite: bool,
 }
 
 /// Args for `kbench beam` (github.com/mohammadtavakoli78/BEAM).
@@ -1039,6 +1043,7 @@ fn run_locomo_cmd(args: LocomoArgs, bench_dir: &Path) {
         iterations: args.iterations,
         learn: args.learn,
         workspace_root: args.workspace_root.clone(),
+        self_cite: args.self_cite,
     };
 
     let report = match run_locomo(&cfg) {

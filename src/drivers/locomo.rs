@@ -202,6 +202,10 @@ pub struct LocomoConfig {
     /// process restarts; ingest is skipped when a brain already exists).
     /// None = temp dirs (single-iteration behaviour).
     pub workspace_root: Option<PathBuf>,
+    /// Full-power mode: the reader itself reports which memories it used
+    /// (a CITED: line in its answer) instead of the harness citing top-k
+    /// retrieved. Real cite_memory semantics, zero extra calls.
+    pub self_cite: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -589,26 +593,60 @@ pub fn run_locomo(cfg: &LocomoConfig) -> Result<LocomoReport, LmeError> {
                     guard[si].as_ref().map(|w| w.path().to_path_buf())
                 };
                 let Some(ws_path) = ws_path else { continue };
-                for id in r.top_memory_ids.iter().take(2) {
-                    let ok = Command::new(&kimetsu_bin)
-                        .current_dir(&ws_path)
-                        .args([
-                            "brain",
-                            "cite",
-                            "--memory-id",
-                            id,
-                            "--note",
-                            "locomo: answered correctly",
-                        ])
-                        .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false);
-                    if ok {
-                        cites += 1;
-                    }
+                if r.top_memory_ids.is_empty() {
+                    continue;
+                }
+                // ONE grouped call: the group is the co-citation signal that
+                // `brain reinforce --staple` consolidates, and --query feeds
+                // the routing index.
+                let mut cmd = Command::new(&kimetsu_bin);
+                cmd.current_dir(&ws_path).args(["brain", "cite"]);
+                for id in r.top_memory_ids.iter().take(4) {
+                    cmd.args(["--memory-id", id]);
+                }
+                cmd.args(["--note", "locomo: answered correctly"]);
+                cmd.args(["--query", &r.question]);
+                let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
+                if ok {
+                    cites += r.top_memory_ids.len().min(4);
                 }
             }
             eprintln!("locomo: feedback applied ({cites} citations from train half)");
+            // Consolidation v1: staple co-cited memories + rebuild the
+            // query-routing index before the next iteration retrieves.
+            let mut staples = 0usize;
+            let mut routes = 0usize;
+            for si in needed.iter() {
+                let ws_path = {
+                    let guard = ws_slots.lock().unwrap();
+                    guard[*si].as_ref().map(|w| w.path().to_path_buf())
+                };
+                if let Some(ws_path) = ws_path
+                    && let Ok(out) = Command::new(&kimetsu_bin)
+                        .current_dir(&ws_path)
+                        .args(["brain", "reinforce", "--staple", "--routes"])
+                        .output()
+                    {
+                        let s = String::from_utf8_lossy(&out.stdout);
+                        // "reinforce: N staple candidate(s), M staple(s) created, K route(s) built"
+                        for (label, sink) in [
+                            ("staple(s) created", &mut staples),
+                            ("route(s) built", &mut routes),
+                        ] {
+                            if let Some(pos) = s.find(label) {
+                                let head = &s[..pos];
+                                if let Some(n) = head
+                                    .split_whitespace()
+                                    .last()
+                                    .and_then(|w| w.parse::<usize>().ok())
+                                {
+                                    *sink += n;
+                                }
+                            }
+                        }
+                    }
+            }
+            eprintln!("locomo: reinforce applied ({staples} staples, {routes} routes)");
             for si in needed.iter() {
                 let ws_path = {
                     let guard = ws_slots.lock().unwrap();
@@ -764,8 +802,20 @@ fn answer_one(
         .last()
         .map(|s| s.date_time.clone())
         .unwrap_or_default();
-    let prompt = codex_reader_prompt(&item.qa.question, &context, &question_date);
-    let predicted = match cfg.llm_backend {
+    let mut prompt = codex_reader_prompt(&item.qa.question, &context, &question_date);
+    if cfg.self_cite {
+        // Full-power mode: the AGENT decides which memories it leaned on —
+        // the real cite_memory semantics instead of the harness guessing
+        // "top-2 retrieved". Same call, zero extra invocations.
+        prompt.push_str(
+            "\n\nAfter your answer, output ONE final line of the form\n\
+             CITED: memory:<ID>, memory:<ID>\n\
+             listing ONLY the memory ids (shown in the context lines) whose \
+             content you actually used to answer. If you used none, output \
+             exactly: CITED: none",
+        );
+    }
+    let raw_predicted = match cfg.llm_backend {
         LlmBackend::Codex => codex_call(&prompt, cfg.llm_model.as_deref(), Some(&reader_effort()))?,
         LlmBackend::Claude => claude_call(&prompt, cfg.llm_model.as_deref())?,
         LlmBackend::Http => {
@@ -773,6 +823,15 @@ fn answer_one(
                 "locomo supports --reader-backend codex|claude".to_string(),
             ));
         }
+    };
+    // Split the CITED line off so the judge never sees it.
+    let (predicted, self_cited_ids) = if cfg.self_cite {
+        match raw_predicted.rsplit_once("CITED:") {
+            Some((answer, cited)) => (answer.trim().to_string(), parse_top_memory_ids(cited, 4)),
+            None => (raw_predicted, vec![]),
+        }
+    } else {
+        (raw_predicted, vec![])
     };
 
     // Judge. Category 5 is adversarial: unanswerable, so abstention is correct.
@@ -826,7 +885,13 @@ fn answer_one(
         gold,
         score,
         train: item.train,
-        top_memory_ids: parse_top_memory_ids(&context, 3),
+        // Self-cite mode trusts the agent completely: "CITED: none" means
+        // cite nothing (no fallback to top-retrieved).
+        top_memory_ids: if cfg.self_cite {
+            self_cited_ids
+        } else {
+            parse_top_memory_ids(&context, 3)
+        },
     })
 }
 
@@ -990,6 +1055,7 @@ mod tests {
             iterations: 1,
             learn: false,
             workspace_root: None,
+            self_cite: false,
         };
         // dry_run: selection happens before any model call; total reflects it
         let report = run_locomo(&cfg).unwrap();
