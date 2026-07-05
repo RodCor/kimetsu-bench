@@ -272,6 +272,10 @@ pub struct LocomoArgs {
     /// per session; facts stored alongside raw turns).
     #[arg(long)]
     distill_ingest: bool,
+    /// Judge with the industry-standard generous rubric and score the
+    /// standard 4-category question set.
+    #[arg(long)]
+    generous_judge: bool,
 }
 
 /// Args for `kbench beam` (github.com/mohammadtavakoli78/BEAM).
@@ -1049,6 +1053,7 @@ fn run_locomo_cmd(args: LocomoArgs, bench_dir: &Path) {
         workspace_root: args.workspace_root.clone(),
         self_cite: args.self_cite,
         distill_ingest: args.distill_ingest,
+        generous_judge: args.generous_judge,
     };
 
     let report = match run_locomo(&cfg) {
