@@ -955,6 +955,19 @@ pub fn codex_call(
                         .code()
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "signal".to_string());
+                    // Classify quota death canonically even on non-zero exit:
+                    // codex has TWO limit modes (exit 0 + stderr message, and
+                    // exit 126 + the same message). Downstream quota handling
+                    // (judge propagation, wait gates) matches on "usage
+                    // limit", so the message must say it in both modes.
+                    let stderr_text = stderr_handle
+                        .and_then(|h| h.join().ok())
+                        .unwrap_or_default();
+                    if stderr_text.contains("hit your usage limit") {
+                        return Err(LmeError::LlmError(format!(
+                            "codex usage limit hit (exit {code}; quota window exhausted)"
+                        )));
+                    }
                     return Err(LmeError::LlmError(format!(
                         "codex exec exited with code {code}"
                     )));
