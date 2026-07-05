@@ -570,7 +570,7 @@ pub fn require_embeddings_build(kimetsu_bin: &str) -> Result<(), LmeError> {
             LmeError::KimetsuError(format!("could not run `{kimetsu_bin} --version`: {e}"))
         })?;
     let version = String::from_utf8_lossy(&out.stdout);
-    if version.contains("(embeddings)") {
+    if version.contains("(embeddings") {
         return Ok(());
     }
     Err(LmeError::KimetsuError(format!(
