@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-agent"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-brain"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "blake3",
  "fastembed",
@@ -1810,7 +1810,7 @@ dependencies = [
 
 [[package]]
 name = "kimetsu-core"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "serde",
  "serde_json",

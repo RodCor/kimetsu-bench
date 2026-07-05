@@ -902,6 +902,11 @@ pub fn codex_call(
     };
     // Feed the prompt over stdin (see the `-` arg above).
     cmd.stdin(std::process::Stdio::piped());
+    // Pipe stderr: codex prints the ChatGPT usage-limit message THERE (with
+    // exit 0 and sometimes a plausible answer file), which is how three
+    // separate benchmark iterations got silently poisoned before this. We
+    // capture it, re-print it (log fidelity), and scan it for quota death.
+    cmd.stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| {
         LmeError::LlmError(format!(
@@ -920,6 +925,20 @@ pub fn codex_call(
             let _ = stdin.write_all(&prompt_bytes);
         });
     }
+
+    // Drain stderr concurrently (avoids pipe-buffer deadlock) and keep the
+    // text for the quota check after exit.
+    let stderr_handle = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            if !buf.trim().is_empty() {
+                eprint!("{buf}");
+            }
+            buf
+        })
+    });
 
     // Poll with a timeout.  std::process::Command has no built-in timeout;
     // we use try_wait in a sleep loop and kill on expiry.
@@ -961,6 +980,20 @@ pub fn codex_call(
     }
 
     // Read the answer file.
+    // Quota check on STDERR before trusting the answer file: codex reports
+    // the usage limit there with exit 0, sometimes leaving a stale/partial
+    // answer file that would grade as an ordinary wrong answer.
+    if let Some(handle) = stderr_handle {
+        if let Ok(stderr_text) = handle.join() {
+            if stderr_text.contains("hit your usage limit") {
+                return Err(LmeError::LlmError(
+                    "codex usage limit hit (reported on stderr; quota window exhausted)"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     let answer = std::fs::read_to_string(&answer_file).map_err(|e| {
         LmeError::LlmError(format!(
             "codex exec succeeded but answer file is missing/unreadable \

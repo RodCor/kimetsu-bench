@@ -206,6 +206,9 @@ pub struct LocomoConfig {
     /// (a CITED: line in its answer) instead of the harness citing top-k
     /// retrieved. Real cite_memory semantics, zero extra calls.
     pub self_cite: bool,
+    /// Distill each session into declarative fact memories at ingest (one
+    /// reader call per session), stored alongside the raw turns.
+    pub distill_ingest: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -414,6 +417,7 @@ pub fn run_locomo(cfg: &LocomoConfig) -> Result<LocomoReport, LmeError> {
             let samples = &samples;
             let kimetsu_bin = kimetsu_bin.clone();
             let root = cfg.workspace_root.clone();
+            let cfg = cfg.clone();
             scope.spawn(move || {
                 loop {
                     let k = next.fetch_add(1, Ordering::SeqCst);
@@ -421,7 +425,7 @@ pub fn run_locomo(cfg: &LocomoConfig) -> Result<LocomoReport, LmeError> {
                         break;
                     }
                     let si = ingest_list[k];
-                    match ingest_sample(&samples[si], &kimetsu_bin, root.as_deref()) {
+                    match ingest_sample(&samples[si], &kimetsu_bin, root.as_deref(), &cfg) {
                         Ok(ws) => {
                             eprintln!(
                                 "  [ingest {}/{}] {} ok",
@@ -626,25 +630,25 @@ pub fn run_locomo(cfg: &LocomoConfig) -> Result<LocomoReport, LmeError> {
                         .current_dir(&ws_path)
                         .args(["brain", "reinforce", "--staple", "--routes"])
                         .output()
-                    {
-                        let s = String::from_utf8_lossy(&out.stdout);
-                        // "reinforce: N staple candidate(s), M staple(s) created, K route(s) built"
-                        for (label, sink) in [
-                            ("staple(s) created", &mut staples),
-                            ("route(s) built", &mut routes),
-                        ] {
-                            if let Some(pos) = s.find(label) {
-                                let head = &s[..pos];
-                                if let Some(n) = head
-                                    .split_whitespace()
-                                    .last()
-                                    .and_then(|w| w.parse::<usize>().ok())
-                                {
-                                    *sink += n;
-                                }
+                {
+                    let s = String::from_utf8_lossy(&out.stdout);
+                    // "reinforce: N staple candidate(s), M staple(s) created, K route(s) built"
+                    for (label, sink) in [
+                        ("staple(s) created", &mut staples),
+                        ("route(s) built", &mut routes),
+                    ] {
+                        if let Some(pos) = s.find(label) {
+                            let head = &s[..pos];
+                            if let Some(n) = head
+                                .split_whitespace()
+                                .last()
+                                .and_then(|w| w.parse::<usize>().ok())
+                            {
+                                *sink += n;
                             }
                         }
                     }
+                }
             }
             eprintln!("locomo: reinforce applied ({staples} staples, {routes} routes)");
             for si in needed.iter() {
@@ -687,6 +691,7 @@ fn ingest_sample(
     sample: &LocomoSample,
     kimetsu_bin: &str,
     root: Option<&Path>,
+    cfg: &LocomoConfig,
 ) -> Result<Ws, LmeError> {
     let holder = match root {
         Some(root) => {
@@ -747,6 +752,80 @@ fn ingest_sample(
             );
         }
     }
+    // v2.5.2 --distill-ingest: the representation fix. Raw chat turns force
+    // the reader to reverse-engineer dialogue; the 90%+ systems store
+    // LLM-extracted atomic facts instead. One reader call per SESSION
+    // distills declarative facts, stored ALONGSIDE the raw turns (two-tier,
+    // same keep-the-originals discipline as staples). This mirrors real
+    // usage where the host agent distills via `brain record` — the agent's
+    // tokens, not a memory-pipeline LLM. Per-session failures (quota etc.)
+    // are logged and skipped: the raw turns remain as the floor.
+    if cfg.distill_ingest {
+        let mut distilled = 0usize;
+        for sess in &sample.sessions {
+            let convo = sess
+                .turns
+                .iter()
+                .map(|(sp, tx)| format!("{sp}: {tx}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let prompt = format!(
+                "Extract the durable facts from this single session of a two-person \
+                 conversation (dated {date}).\n\nRules:\n\
+                 - One fact per line, declarative, self-contained.\n\
+                 - Always name the person the fact is about.\n\
+                 - Include events with their dates, plans, preferences, possessions, \
+                 relationships, and changes to earlier facts.\n\
+                 - No commentary, no numbering, no headers. Facts only.\n\n\
+                 Conversation:\n{convo}",
+                date = if sess.date_time.is_empty() {
+                    "unknown date".to_string()
+                } else {
+                    sess.date_time.clone()
+                },
+            );
+            let reply = match cfg.llm_backend {
+                LlmBackend::Codex => {
+                    codex_call(&prompt, cfg.llm_model.as_deref(), Some(&reader_effort()))
+                }
+                LlmBackend::Claude => claude_call(&prompt, cfg.llm_model.as_deref()),
+                LlmBackend::Http => Err(LmeError::LlmError("distill needs codex|claude".into())),
+            };
+            match reply {
+                Ok(facts) => {
+                    for line in facts.lines() {
+                        let fact = line.trim().trim_start_matches(['-', '*', ' ']).trim();
+                        if fact.len() < 8 {
+                            continue;
+                        }
+                        let tagged = if sess.date_time.is_empty() {
+                            format!("[session {}] {fact}", sess.index)
+                        } else {
+                            format!("[session {} | {}] {fact}", sess.index, sess.date_time)
+                        };
+                        entries.push(
+                            serde_json::json!({ "text": tagged, "scope": "project", "kind": "fact" })
+                                .to_string(),
+                        );
+                        distilled += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  [distill] {} session {}: skipped ({e})",
+                        sample.sample_id, sess.index
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "  [distill] {}: {} fact(s) extracted across {} session(s)",
+            sample.sample_id,
+            distilled,
+            sample.sessions.len()
+        );
+    }
+
     let batch = ws.join("locomo-batch.jsonl");
     std::fs::write(&batch, entries.join("\n"))
         .map_err(|e| LmeError::KimetsuError(format!("write batch: {e}")))?;
@@ -1056,6 +1135,7 @@ mod tests {
             learn: false,
             workspace_root: None,
             self_cite: false,
+            distill_ingest: false,
         };
         // dry_run: selection happens before any model call; total reflects it
         let report = run_locomo(&cfg).unwrap();

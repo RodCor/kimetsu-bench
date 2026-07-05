@@ -268,6 +268,10 @@ pub struct LocomoArgs {
     /// (CITED: line) instead of the harness citing top-k retrieved.
     #[arg(long)]
     self_cite: bool,
+    /// Distill each session into fact memories at ingest (one reader call
+    /// per session; facts stored alongside raw turns).
+    #[arg(long)]
+    distill_ingest: bool,
 }
 
 /// Args for `kbench beam` (github.com/mohammadtavakoli78/BEAM).
@@ -1044,6 +1048,7 @@ fn run_locomo_cmd(args: LocomoArgs, bench_dir: &Path) {
         learn: args.learn,
         workspace_root: args.workspace_root.clone(),
         self_cite: args.self_cite,
+        distill_ingest: args.distill_ingest,
     };
 
     let report = match run_locomo(&cfg) {
