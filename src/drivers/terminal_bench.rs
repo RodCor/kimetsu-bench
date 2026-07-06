@@ -123,6 +123,11 @@ signals from related tasks. Apply any relevant findings to your plan.\n\n\
 transferable lesson (a useful command, a gotcha, an anti-pattern), include it in \
 `generalized_memory` with `memory_role=\"semantic_operator\"` or `anti_pattern` so \
 future tasks benefit.\n\n\
+3. **DURING the task**, whenever a lesson from step 1 materially guides an action \
+(you run a command it suggested, avoid its anti-pattern, reuse its fix), call \
+`mcp__kimetsu__kimetsu_brain_cite` with that memory's `memory_id` and a short note. \
+This is the credit signal that makes genuinely useful lessons rank higher on future \
+tasks — cite each helpful memory once, and only when it actually helped.\n\n\
 The brain is empty on the very first task; capsules accumulate as you finish each one. \
 Don't skip these steps — they're how kimetsu earns its keep over the gauntlet.\n";
 
