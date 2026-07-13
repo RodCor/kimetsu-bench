@@ -570,7 +570,7 @@ pub fn require_embeddings_build(kimetsu_bin: &str) -> Result<(), LmeError> {
             LmeError::KimetsuError(format!("could not run `{kimetsu_bin} --version`: {e}"))
         })?;
     let version = String::from_utf8_lossy(&out.stdout);
-    if version.contains("(embeddings)") {
+    if version.contains("(embeddings") {
         return Ok(());
     }
     Err(LmeError::KimetsuError(format!(
@@ -902,6 +902,11 @@ pub fn codex_call(
     };
     // Feed the prompt over stdin (see the `-` arg above).
     cmd.stdin(std::process::Stdio::piped());
+    // Pipe stderr: codex prints the ChatGPT usage-limit message THERE (with
+    // exit 0 and sometimes a plausible answer file), which is how three
+    // separate benchmark iterations got silently poisoned before this. We
+    // capture it, re-print it (log fidelity), and scan it for quota death.
+    cmd.stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| {
         LmeError::LlmError(format!(
@@ -921,6 +926,20 @@ pub fn codex_call(
         });
     }
 
+    // Drain stderr concurrently (avoids pipe-buffer deadlock) and keep the
+    // text for the quota check after exit.
+    let stderr_handle = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            if !buf.trim().is_empty() {
+                eprint!("{buf}");
+            }
+            buf
+        })
+    });
+
     // Poll with a timeout.  std::process::Command has no built-in timeout;
     // we use try_wait in a sleep loop and kill on expiry.
     let timeout_secs = llm_timeout_secs();
@@ -936,6 +955,19 @@ pub fn codex_call(
                         .code()
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "signal".to_string());
+                    // Classify quota death canonically even on non-zero exit:
+                    // codex has TWO limit modes (exit 0 + stderr message, and
+                    // exit 126 + the same message). Downstream quota handling
+                    // (judge propagation, wait gates) matches on "usage
+                    // limit", so the message must say it in both modes.
+                    let stderr_text = stderr_handle
+                        .and_then(|h| h.join().ok())
+                        .unwrap_or_default();
+                    if stderr_text.contains("hit your usage limit") {
+                        return Err(LmeError::LlmError(format!(
+                            "codex usage limit hit (exit {code}; quota window exhausted)"
+                        )));
+                    }
                     return Err(LmeError::LlmError(format!(
                         "codex exec exited with code {code}"
                     )));
@@ -961,6 +993,18 @@ pub fn codex_call(
     }
 
     // Read the answer file.
+    // Quota check on STDERR before trusting the answer file: codex reports
+    // the usage limit there with exit 0, sometimes leaving a stale/partial
+    // answer file that would grade as an ordinary wrong answer.
+    if let Some(handle) = stderr_handle
+        && let Ok(stderr_text) = handle.join()
+        && stderr_text.contains("hit your usage limit")
+    {
+        return Err(LmeError::LlmError(
+            "codex usage limit hit (reported on stderr; quota window exhausted)".to_string(),
+        ));
+    }
+
     let answer = std::fs::read_to_string(&answer_file).map_err(|e| {
         LmeError::LlmError(format!(
             "codex exec succeeded but answer file is missing/unreadable \
@@ -976,8 +1020,39 @@ pub fn codex_call(
         ));
     }
 
+    // Quota exhaustion is NOT an answer: codex prints the ChatGPT usage-limit
+    // message with EXIT 0, which silently poisoned two k=5 learning runs
+    // (every verdict counted INCORRECT, zero error rows, score floored at the
+    // abstention-credit fraction). Surface it as an error so error counting,
+    // retries, and quota gates all see it.
+    if trimmed.contains("hit your usage limit") {
+        return Err(LmeError::LlmError(format!(
+            "codex usage limit hit (quota window exhausted): {}",
+            trimmed.lines().next().unwrap_or_default()
+        )));
+    }
+
     // tmp_dir dropped here — temp dir cleaned up automatically.
     Ok(trimmed)
+}
+
+/// Block until codex answers a trivial probe (quota window alive). Checks every
+/// 10 minutes for up to `max_hours`. Returns false if it never recovered.
+pub fn wait_for_codex(model: Option<&str>, max_hours: u32) -> bool {
+    let checks = max_hours * 6;
+    for i in 0..checks.max(1) {
+        match codex_call("reply with exactly: OK", model, None) {
+            Ok(a) if a.contains("OK") => return true,
+            _ => {}
+        }
+        eprintln!(
+            "  [quota] codex unavailable; waiting 10min (check {}/{})",
+            i + 1,
+            checks
+        );
+        std::thread::sleep(std::time::Duration::from_secs(600));
+    }
+    false
 }
 
 /// Reader/judge via the `claude -p` CLI (Claude Code local login, no API key).
@@ -1258,6 +1333,10 @@ fn judge_answer(
                     };
                     (score, format!("codex judge: {}", reply.trim()))
                 }
+                Err(e) if e.to_string().contains("usage limit") => (
+                    0.0,
+                    format!("ERROR (counted incorrect): judge quota death: {e}"),
+                ),
                 Err(e) => {
                     eprintln!("    [codex judge] warn: {e} — falling back to heuristic");
                     (
@@ -1280,6 +1359,10 @@ fn judge_answer(
                     };
                     (score, format!("claude judge: {}", reply.trim()))
                 }
+                Err(e) if e.to_string().contains("usage limit") => (
+                    0.0,
+                    format!("ERROR (counted incorrect): judge quota death: {e}"),
+                ),
                 Err(e) => {
                     eprintln!("    [claude judge] warn: {e} — falling back to heuristic");
                     (
