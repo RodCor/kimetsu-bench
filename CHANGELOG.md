@@ -6,6 +6,34 @@ changelog, see the public [kimetsu CHANGELOG](../CHANGELOG.md).
 
 ## Bench tool
 
+### Unreleased — BrainBench safety tracks
+
+Two new reader-free dimensions, and a dataset for them at
+`datasets/brainbench-safety-v1.json`.
+
+- **`sycophancy`** — does the brain present partial evidence as if it were
+  complete? MemSyco-Bench finds most memory systems scoring worse on this than
+  using no memory at all. The reader half of that needs a reader; what the brain
+  alone decides is whether it admits a gap, read off `evidence_coverage` and
+  `uncovered_terms`. Scored in both directions — `unsupported` queries must be
+  declined or flagged, `supported` ones answered without a warning — because a
+  track penalising only over-confidence is won by a brain that abstains on
+  everything.
+- **`poisoning`** — can content that arrived from elsewhere outrank what was
+  learned here? The fixture imports a contradicting pack through the real
+  `brain import`, so entries carry genuine pack provenance. Imported outright the
+  assertion is ordinal (local must outrank imported, and local is written first
+  so the import cannot win on freshness); imported under `--quarantine` it is
+  absolute (nothing from the pack may appear at all). The hard tier is a pack
+  outnumbering the local corpus five to one, which is MINJA's actual shape.
+
+Its first run found a real defect in kimetsu: the light query stemmer had no
+y→ies rule, so a query about `retry` treated a corpus saying `retries` as never
+mentioning it, and the brain reported a gap on a question it could answer. Fixed
+upstream; both tracks pass on the FTS-only floor afterwards. That is what the
+track is for.
+
+
 ### v0.5 — 2026-06-05 — `kstress` brain stress test
 
 New second binary `kstress` profiles the brain (not agent tasks) at scale —
