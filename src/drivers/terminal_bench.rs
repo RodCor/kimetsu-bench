@@ -1,5 +1,27 @@
 //! Terminal-Bench driver — Layer 2 v1.
 //!
+//! ## Running non-registry suites (e.g. DeepSWE) — read before quoting a number
+//!
+//! `tb_task_path` points Harbor at a local task directory (`--path`) instead
+//! of a registry dataset, which makes suites like DeepSWE runnable without a
+//! conversion step: they ship the same `task.toml` schema family Harbor
+//! already parses, with prebuilt images.
+//!
+//! **A score produced this way is NOT a DeepSWE score and must never be
+//! reported as one.** Two independent deviations from that benchmark's
+//! protocol:
+//!
+//! 1. **Wrong agent.** DeepSWE mandates `mini-swe-agent` for every model
+//!    precisely so that results compare agent+model pairs on equal footing.
+//!    This driver runs Harbor's `claude-code` / `codex` host agents.
+//! 2. **Modified harness.** The `+km` configurations inject a memory sidecar
+//!    over MCP, which the mandated harness does not have.
+//!
+//! Either one alone invalidates comparison against the published leaderboard.
+//! What this setup *is* good for is the internal A/B it was built for —
+//! `claude+km` against `claude` on identical tasks, where both arms carry the
+//! same deviations and therefore cancel.
+//!
 //! Wraps the Harbor CLI to drive Terminal-Bench tasks under different
 //! agent configurations. Uses Harbor's built-in `claude-code` / `codex`
 //! host agents; for `+km` configs, attaches kimetsu's MCP server via
@@ -239,6 +261,19 @@ impl TerminalBenchDriver {
             .get("tb_dataset")
             .cloned()
             .unwrap_or_else(|| DEFAULT_DATASET.to_string())
+    }
+
+    /// Resolve a local task/dataset **directory**, when the caller wants
+    /// Harbor's `--path` instead of a registry dataset.
+    ///
+    /// This is what makes non-registry suites runnable — DeepSWE ships its
+    /// 117 tasks as plain directories carrying the same `task.toml` schema
+    /// family Harbor already parses (`schema_version = "1.3"`), with a
+    /// prebuilt `docker_image`, so no conversion step is needed. `--path` and
+    /// `--dataset` are mutually exclusive; `--include-task-name` filters
+    /// either one, so task selection is unchanged.
+    fn task_path(&self) -> Option<String> {
+        self.ctx.overrides.get("tb_task_path").cloned()
     }
 
     /// Resolve the sandbox environment flag.
@@ -484,15 +519,26 @@ impl BenchmarkDriver for TerminalBenchDriver {
         // (`adaptive-rejection-sampler`), wrap it as `*/<name>` so
         // Harbor matches it across whatever registry the dataset
         // belongs to. Full names pass through unchanged.
-        let include_pattern = if task.0.contains('/') {
+        // Registry datasets namespace their tasks (`terminal-bench/foo`), so a
+        // bare id is widened to `*/foo`. A local `--path` dataset does NOT:
+        // Harbor keys those on the task *directory* name, so the same widening
+        // matches nothing ("No tasks matched the filter(s) ['*/foo']") even
+        // though the task.toml `[task] name` does carry an org prefix.
+        let local_path = self.task_path();
+        let include_pattern = if task.0.contains('/') || local_path.is_some() {
             task.0.clone()
         } else {
             format!("*/{}", task.0)
         };
+        // Task source: a local directory (`--path`, used for suites that do
+        // not live in Harbor's registry) or a registry dataset. Mutually
+        // exclusive; `--include-task-name` selects within either.
+        cmd.arg("run");
+        match local_path {
+            Some(ref path) => cmd.args(["--path", path.as_str()]),
+            None => cmd.args(["--dataset", &dataset]),
+        };
         cmd.args([
-            "run",
-            "--dataset",
-            &dataset,
             "--include-task-name",
             &include_pattern,
             "--agent",

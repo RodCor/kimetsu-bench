@@ -24,3 +24,8 @@
 # converters, docs, and the datasets/ config manifest), never the data or the
 # numbers. Drivers write reports to local/runs/; converters default to local/.
 /local/
+
+# Vendored benchmark suites (cloned on demand; see README).
+# MUST be cloned with LF endings or every .sh breaks on Linux:
+#   git -c core.autocrlf=false -c core.eol=lf clone <url>
+/vendor/
