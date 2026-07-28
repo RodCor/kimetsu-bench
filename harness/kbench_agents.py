@@ -108,6 +108,18 @@ class CaptureCodex(_CaptureMixin, Codex):
     """`codex`, plus the same capture."""
 
 
+class _AgentDirOnly:
+    """Stand-in for Harbor's ``TrialPaths``.
+
+    ``OracleAgent`` touches exactly one attribute of it, ``agent_dir``, and
+    Harbor passes ``logs_dir=trial_paths.agent_dir`` — so the two are the same
+    directory and this shim loses nothing.
+    """
+
+    def __init__(self, agent_dir):
+        self.agent_dir = agent_dir
+
+
 class CaptureOracle(_CaptureMixin, OracleAgent):
     """`oracle` (runs the task's own solution), plus the same capture.
 
@@ -116,4 +128,25 @@ class CaptureOracle(_CaptureMixin, OracleAgent):
     commit → diff → collect → upload → apply → grade. Hand-placing a
     ``model.patch`` would prove only the grader and leave the capture, which is
     the half that was actually broken, untested.
+
+    Harbor injects ``task_dir``/``trial_paths`` only when the agent is selected
+    by the *name* ``oracle`` (``Trial._init_agent`` keys off
+    ``AgentName.ORACLE.value``). Reaching it through ``--agent-import-path``
+    skips that branch, so both must be tolerated as missing: ``trial_paths`` is
+    reconstructible, and ``task_dir`` has to be supplied explicitly with
+    ``--agent-kwarg task_dir=<path>``.
     """
+
+    def __init__(self, logs_dir, task_dir=None, trial_paths=None, **kwargs):
+        if task_dir is None:
+            raise ValueError(
+                "CaptureOracle needs the task directory, which Harbor only "
+                "injects for the built-in `oracle` agent. Pass it explicitly: "
+                "--agent-kwarg task_dir=/path/to/tasks/<task-id>"
+            )
+        super().__init__(
+            logs_dir=logs_dir,
+            task_dir=task_dir,
+            trial_paths=trial_paths or _AgentDirOnly(logs_dir),
+            **kwargs,
+        )
