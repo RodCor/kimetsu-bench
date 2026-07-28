@@ -2010,7 +2010,13 @@ fn run_poisoning(
     // mechanism it claims to test. So: build the pack in a throwaway brain,
     // export it, and import it here.
     if !spec.pack.is_empty() {
-        import_pack(workspace, kimetsu_bin, &spec.pack, spec.quarantine, &scenario.id)?;
+        import_pack(
+            workspace,
+            kimetsu_bin,
+            &spec.pack,
+            spec.quarantine,
+            &scenario.id,
+        )?;
     }
 
     let mut passed = 0usize;
@@ -2051,9 +2057,9 @@ fn run_poisoning(
             total += 1;
             match (ranked.iter().position(|r| r == key), worst_pack) {
                 (Some(local_at), Some(pack_at)) if local_at < pack_at => passed += 1,
-                (Some(local_at), Some(pack_at)) => {
-                    notes.push(format!("{key} at {local_at} ranked below pack at {pack_at}"))
-                }
+                (Some(local_at), Some(pack_at)) => notes.push(format!(
+                    "{key} at {local_at} ranked below pack at {pack_at}"
+                )),
                 (Some(_), None) => passed += 1, // no pack entry surfaced at all
                 (None, _) => notes.push(format!("{key} did not surface")),
             }
@@ -2065,12 +2071,19 @@ fn run_poisoning(
         total += 1;
         match audit_burst_count(workspace, kimetsu_bin) {
             Ok(n) if n >= spec.expect_bursts => passed += 1,
-            Ok(n) => notes.push(format!("audit flagged {n} burst(s), expected >= {}", spec.expect_bursts)),
+            Ok(n) => notes.push(format!(
+                "audit flagged {n} burst(s), expected >= {}",
+                spec.expect_bursts
+            )),
             Err(e) => notes.push(format!("audit failed: {e}")),
         }
     }
 
-    let score = if total == 0 { 1.0 } else { passed as f64 / total as f64 };
+    let score = if total == 0 {
+        1.0
+    } else {
+        passed as f64 / total as f64
+    };
     let detail = if notes.is_empty() {
         format!("{passed}/{total} poisoning assertions held")
     } else {
@@ -2166,7 +2179,9 @@ fn audit_burst_count(workspace: &Path, kimetsu_bin: &str) -> Result<usize, Brain
     let body = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(body.trim())
         .map_err(|e| BrainBenchError::KimetsuError(format!("audit json: {e}")))?;
-    Ok(v.get("bursts").and_then(|b| b.as_array()).map_or(0, |a| a.len()))
+    Ok(v.get("bursts")
+        .and_then(|b| b.as_array())
+        .map_or(0, |a| a.len()))
 }
 
 /// v2.6 render-contract track — what the injected text says, not how a reader
@@ -2252,7 +2267,11 @@ fn run_render_contract(
         }
     }
 
-    let score = if total == 0 { 1.0 } else { passed as f64 / total as f64 };
+    let score = if total == 0 {
+        1.0
+    } else {
+        passed as f64 / total as f64
+    };
     let detail = if notes.is_empty() {
         format!("{passed}/{total} contract clauses held")
     } else {
@@ -2427,9 +2446,7 @@ pub fn run_single_scenario(
             run_forgetting(scenario, workspace, kimetsu_bin, cfg.budget_tokens)
         }
         Dimension::Calibration => run_calibration(scenario, workspace, kimetsu_bin),
-        Dimension::Poisoning => {
-            run_poisoning(scenario, workspace, kimetsu_bin, cfg.budget_tokens)
-        }
+        Dimension::Poisoning => run_poisoning(scenario, workspace, kimetsu_bin, cfg.budget_tokens),
         Dimension::RenderContract => run_render_contract(scenario, workspace, kimetsu_bin),
         Dimension::WritePrecision => run_write_precision(
             scenario,
