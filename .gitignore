@@ -29,3 +29,8 @@
 # MUST be cloned with LF endings or every .sh breaks on Linux:
 #   git -c core.autocrlf=false -c core.eol=lf clone <url>
 /vendor/
+
+# kbench run logs written at the repo root
+/deepswe-run.log
+/brainbench-full.md
+/brainbench-full.err

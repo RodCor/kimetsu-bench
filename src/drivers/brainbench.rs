@@ -104,6 +104,21 @@ pub enum Dimension {
     Calibration,
     WritePrecision,
     Graph,
+    /// v2.6: does the brain resist a poisoned/imported corpus? Reader-free by
+    /// construction — every assertion has one deterministic right answer:
+    /// trust-weighted ranking (4a), import quarantine (4b), and `brain audit`
+    /// write-burst detection. Tests shipped mechanisms, not model behaviour.
+    Poisoning,
+    /// v2.6: does the rendered bundle carry the contract a reader needs?
+    ///
+    /// **This is deliberately NOT called "sycophancy".** MemSyco-Bench measures
+    /// a *reader* over-deferring to memory against evidence in front of it, and
+    /// BrainBench has no reader — so that property is not measurable here. What
+    /// is measurable is whether the injected text contains the preconditions
+    /// for not deferring: the prior-conclusion framing, the conflict rule, the
+    /// dates on an ordering query, the "does not cover" line. A high score here
+    /// means the contract is intact, NOT that the brain resists sycophancy.
+    RenderContract,
 }
 
 impl Dimension {
@@ -115,6 +130,8 @@ impl Dimension {
             Dimension::Forgetting => "forgetting",
             Dimension::Calibration => "calibration",
             Dimension::WritePrecision => "write-precision",
+            Dimension::Poisoning => "poisoning",
+            Dimension::RenderContract => "render-contract",
             Dimension::Graph => "graph",
         }
     }
@@ -130,6 +147,8 @@ impl FromStr for Dimension {
             "forgetting" => Ok(Dimension::Forgetting),
             "calibration" => Ok(Dimension::Calibration),
             "write-precision" | "writeprecision" => Ok(Dimension::WritePrecision),
+            "poisoning" => Ok(Dimension::Poisoning),
+            "render-contract" | "rendercontract" | "framing" => Ok(Dimension::RenderContract),
             "graph" => Ok(Dimension::Graph),
             other => Err(format!(
                 "unknown dimension `{other}`; expected one of: retrieval, dedup, \
@@ -268,6 +287,12 @@ pub struct Scenario {
     /// forgetting). Applied via `brain memory set-age`.
     #[serde(default)]
     pub ages: std::collections::HashMap<String, u32>,
+    /// Poisoning-track spec (see [`PoisoningSpec`]).
+    #[serde(default)]
+    pub poisoning: Option<PoisoningSpec>,
+    /// Render-contract spec (see [`RenderContractSpec`]).
+    #[serde(default)]
+    pub render_contract: Option<RenderContractSpec>,
     /// Transcript fed to `brain distill` for write-precision scenarios.
     #[serde(default)]
     pub transcript: Vec<TranscriptTurn>,
@@ -423,6 +448,52 @@ impl std::fmt::Display for BrainBenchError {
 impl std::error::Error for BrainBenchError {}
 
 // ─── Result + Report types ───────────────────────────────────────────────────
+
+/// v2.6: poisoning-resistance spec. Every field maps to a shipped mechanism.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PoisoningSpec {
+    /// Memories introduced as an imported *pack* rather than authored locally,
+    /// so they carry pack provenance and the 4a trust discount.
+    #[serde(default)]
+    pub pack: Vec<Memory>,
+    /// Import the pack held in the review queue (what an `http(s)://` source
+    /// gets by default). Quarantined memories must not reach retrieval at all.
+    #[serde(default)]
+    pub quarantine: bool,
+    /// Query used to inspect ranking once everything is ingested.
+    #[serde(default)]
+    pub query: String,
+    /// Fixture keys that must NOT appear in the bundle — the quarantine and
+    /// "a poisoned memory never silently wins" assertions.
+    #[serde(default)]
+    pub must_not_retrieve: Vec<String>,
+    /// Fixture keys that must outrank every `pack` entry. Corroboration (a
+    /// citation from a successful local run) is what erases the origin
+    /// discount, so scenarios pair this with `cite`.
+    #[serde(default)]
+    pub must_outrank: Vec<String>,
+    /// Minimum number of write bursts `brain audit` must flag. A burst is the
+    /// shape both a bulk import and induced poisoning leave behind.
+    #[serde(default)]
+    pub expect_bursts: usize,
+}
+
+/// v2.6: render-contract spec — what the *injected text* must and must not say.
+///
+/// Not a sycophancy measurement; see [`Dimension::RenderContract`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RenderContractSpec {
+    /// Query whose rendered bundle is inspected.
+    pub query: String,
+    /// Substrings the rendered context must contain (framing, conflict rule,
+    /// a date, the uncovered-terms line).
+    #[serde(default)]
+    pub must_contain: Vec<String>,
+    /// Substrings it must not contain — hedges that tell the agent to distrust
+    /// memory outright, which costs more than the sycophancy it prevents.
+    #[serde(default)]
+    pub must_not_contain: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioResult {
@@ -749,6 +820,8 @@ pub fn expand_eval_fixtures(
                 calibration: None,
                 ages: std::collections::HashMap::new(),
                 transcript: vec![],
+                poisoning: None,
+                render_contract: None,
                 write_gold: vec![],
             });
         }
@@ -852,6 +925,8 @@ pub fn expand_calibration_gen(
             }),
             ages: std::collections::HashMap::new(),
             transcript: vec![],
+            poisoning: None,
+            render_contract: None,
             write_gold: vec![],
         });
     }
@@ -1893,6 +1968,299 @@ fn forget_f1(proposed: &[String], gold: &[String]) -> f64 {
     }
 }
 
+/// v2.6 poisoning track. Reader-free: each assertion has one right answer.
+///
+/// Exercises the three shipped defences in one scenario — 4a trust-weighted
+/// ranking, 4b import quarantine, and `brain audit` burst detection — and
+/// scores the fraction satisfied. A scenario may use any subset; assertions
+/// that are not configured are simply not counted, so an empty spec scores
+/// 1.0 rather than punishing a partially-specified fixture.
+fn run_poisoning(
+    scenario: &Scenario,
+    workspace: &Path,
+    kimetsu_bin: &str,
+    budget: usize,
+) -> Result<ScenarioResult, BrainBenchError> {
+    let Some(spec) = scenario.poisoning.as_ref() else {
+        return Ok(skeleton_result(
+            scenario,
+            0.0,
+            "no `poisoning` spec in scenario".to_string(),
+        ));
+    };
+
+    // Local corpus first: these are the memories that can earn corroboration.
+    ingest(workspace, kimetsu_bin, &scenario.memories)?;
+
+    // Corroboration first: a citation from a successful local run is what
+    // erases the origin discount, so it must land before ranking is inspected.
+    if !scenario.cite.is_empty() {
+        let (id_by_key, _) = list_memory_rows(workspace, kimetsu_bin, &scenario.memories)?;
+        for key in &scenario.cite {
+            if let Some(id) = id_by_key.get(key) {
+                apply_outcome(workspace, kimetsu_bin, "cite", id)?;
+            }
+        }
+    }
+
+    // The pack must arrive as a real IMPORT, not as more local writes. Seeding
+    // it with `memory add` would give it local provenance, so the 4a trust
+    // discount would have nothing to bite on and the 4b quarantine path would
+    // never run — the scenario would pass or fail for reasons unrelated to the
+    // mechanism it claims to test. So: build the pack in a throwaway brain,
+    // export it, and import it here.
+    if !spec.pack.is_empty() {
+        import_pack(workspace, kimetsu_bin, &spec.pack, spec.quarantine, &scenario.id)?;
+    }
+
+    let mut passed = 0usize;
+    let mut total = 0usize;
+    let mut notes: Vec<String> = Vec::new();
+
+    let ranked = if spec.query.trim().is_empty() {
+        Vec::new()
+    } else {
+        let all: Vec<Memory> = scenario
+            .memories
+            .iter()
+            .chain(spec.pack.iter())
+            .cloned()
+            .collect();
+        retrieve_ranked_keys(workspace, kimetsu_bin, &spec.query, budget, &all)?
+    };
+
+    // (1) Quarantined / poisoned content must never reach the bundle.
+    for key in &spec.must_not_retrieve {
+        total += 1;
+        if ranked.iter().any(|k| k == key) {
+            notes.push(format!("{key} reached retrieval but must not"));
+        } else {
+            passed += 1;
+        }
+    }
+
+    // (2) A corroborated local memory must outrank every pack entry. Origin is
+    // a weight, never a gate — so this checks ORDER, not exclusion.
+    if !spec.must_outrank.is_empty() {
+        let pack_keys: Vec<&str> = spec.pack.iter().map(|m| m.key.as_str()).collect();
+        let worst_pack = pack_keys
+            .iter()
+            .filter_map(|k| ranked.iter().position(|r| r == k))
+            .min();
+        for key in &spec.must_outrank {
+            total += 1;
+            match (ranked.iter().position(|r| r == key), worst_pack) {
+                (Some(local_at), Some(pack_at)) if local_at < pack_at => passed += 1,
+                (Some(local_at), Some(pack_at)) => {
+                    notes.push(format!("{key} at {local_at} ranked below pack at {pack_at}"))
+                }
+                (Some(_), None) => passed += 1, // no pack entry surfaced at all
+                (None, _) => notes.push(format!("{key} did not surface")),
+            }
+        }
+    }
+
+    // (3) `brain audit` must see the burst the pack import left behind.
+    if spec.expect_bursts > 0 {
+        total += 1;
+        match audit_burst_count(workspace, kimetsu_bin) {
+            Ok(n) if n >= spec.expect_bursts => passed += 1,
+            Ok(n) => notes.push(format!("audit flagged {n} burst(s), expected >= {}", spec.expect_bursts)),
+            Err(e) => notes.push(format!("audit failed: {e}")),
+        }
+    }
+
+    let score = if total == 0 { 1.0 } else { passed as f64 / total as f64 };
+    let detail = if notes.is_empty() {
+        format!("{passed}/{total} poisoning assertions held")
+    } else {
+        format!("{passed}/{total} held; {}", notes.join("; "))
+    };
+    Ok(skeleton_result(scenario, score, detail))
+}
+
+/// Build a pack from `memories` in a scratch brain, then import it into
+/// `workspace` so the rows carry pack provenance.
+///
+/// `quarantine` mirrors what an `http(s)://` source gets by default: the rows
+/// land in the review queue and must not reach retrieval until accepted.
+fn import_pack(
+    workspace: &Path,
+    kimetsu_bin: &str,
+    memories: &[Memory],
+    quarantine: bool,
+    scenario_id: &str,
+) -> Result<(), BrainBenchError> {
+    let scratch = std::env::temp_dir().join(format!("kbench-pack-{scenario_id}"));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch)
+        .map_err(|e| BrainBenchError::KimetsuError(format!("pack scratch dir: {e}")))?;
+    // A git dir is what project discovery stops at — without it the scratch
+    // brain escapes into $HOME and seeds the developer's real corpus.
+    let _ = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&scratch)
+        .output();
+    let init = Command::new(kimetsu_bin)
+        .current_dir(&scratch)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .arg("init")
+        .output()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("pack brain init: {e}")))?;
+    if !init.status.success() {
+        return Err(BrainBenchError::KimetsuError(format!(
+            "pack brain init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        )));
+    }
+    ingest(&scratch, kimetsu_bin, memories)?;
+
+    let pack_file = scratch.join("pack.json");
+    let export = Command::new(kimetsu_bin)
+        .current_dir(&scratch)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .args(["brain", "export"])
+        .arg(&pack_file)
+        .output()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("pack export: {e}")))?;
+    if !export.status.success() {
+        return Err(BrainBenchError::KimetsuError(format!(
+            "pack export failed: {}",
+            String::from_utf8_lossy(&export.stderr)
+        )));
+    }
+
+    let mut cmd = Command::new(kimetsu_bin);
+    cmd.current_dir(workspace)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .args(["brain", "import"])
+        .arg(&pack_file);
+    // Explicit either way: the default flips on source type, and a scenario
+    // should not depend on which side of that flip a local file lands.
+    cmd.arg(if quarantine {
+        "--quarantine"
+    } else {
+        "--no-quarantine"
+    });
+    let imported = cmd
+        .output()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("pack import: {e}")))?;
+    if !imported.status.success() {
+        return Err(BrainBenchError::KimetsuError(format!(
+            "pack import failed: {}",
+            String::from_utf8_lossy(&imported.stderr)
+        )));
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    Ok(())
+}
+
+/// Count write bursts reported by `brain audit --json`.
+fn audit_burst_count(workspace: &Path, kimetsu_bin: &str) -> Result<usize, BrainBenchError> {
+    let out = Command::new(kimetsu_bin)
+        .current_dir(workspace)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .args(["brain", "audit", "--json"])
+        .output()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("spawn `brain audit`: {e}")))?;
+    let body = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|e| BrainBenchError::KimetsuError(format!("audit json: {e}")))?;
+    Ok(v.get("bursts").and_then(|b| b.as_array()).map_or(0, |a| a.len()))
+}
+
+/// v2.6 render-contract track — what the injected text says, not how a reader
+/// reacts to it. See [`Dimension::RenderContract`] for why this is deliberately
+/// not called a sycophancy measurement.
+fn run_render_contract(
+    scenario: &Scenario,
+    workspace: &Path,
+    kimetsu_bin: &str,
+) -> Result<ScenarioResult, BrainBenchError> {
+    let Some(spec) = scenario.render_contract.as_ref() else {
+        return Ok(skeleton_result(
+            scenario,
+            0.0,
+            "no `render_contract` spec in scenario".to_string(),
+        ));
+    };
+    ingest(workspace, kimetsu_bin, &scenario.memories)?;
+
+    // The contract lives in the HOOK's output, not `brain context`. The latter
+    // prints a scored diagnostic (stage/tokens/capsule lines) with no framing
+    // at all — asserting against it would silently pass every scenario that
+    // depends on the header. `context-hook` is what an agent actually receives.
+    let payload = serde_json::json!({
+        "session_id": format!("render-contract-{}", scenario.id),
+        "prompt": spec.query,
+    })
+    .to_string();
+
+    let mut child = Command::new(kimetsu_bin)
+        .current_dir(workspace)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .args(["brain", "context-hook"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("spawn `brain context-hook`: {e}")))?;
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            BrainBenchError::KimetsuError("context-hook stdin unavailable".to_string())
+        })?;
+        stdin
+            .write_all(payload.as_bytes())
+            .map_err(|e| BrainBenchError::KimetsuError(format!("write hook payload: {e}")))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("context-hook: {e}")))?;
+
+    // Pull `additionalContext` out rather than matching the raw JSON, so
+    // assertions compare against the text the agent sees and are not defeated
+    // by JSON escaping.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let rendered = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .and_then(|v| {
+            v.get("hookSpecificOutput")?
+                .get("additionalContext")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+
+    let mut passed = 0usize;
+    let mut total = 0usize;
+    let mut notes: Vec<String> = Vec::new();
+    for needle in &spec.must_contain {
+        total += 1;
+        if rendered.contains(needle.as_str()) {
+            passed += 1;
+        } else {
+            notes.push(format!("missing {needle:?}"));
+        }
+    }
+    for needle in &spec.must_not_contain {
+        total += 1;
+        if rendered.contains(needle.as_str()) {
+            notes.push(format!("present but forbidden: {needle:?}"));
+        } else {
+            passed += 1;
+        }
+    }
+
+    let score = if total == 0 { 1.0 } else { passed as f64 / total as f64 };
+    let detail = if notes.is_empty() {
+        format!("{passed}/{total} contract clauses held")
+    } else {
+        format!("{passed}/{total} held; {}", notes.join("; "))
+    };
+    Ok(skeleton_result(scenario, score, detail))
+}
+
 fn skeleton_result(scenario: &Scenario, score: f64, detail: String) -> ScenarioResult {
     ScenarioResult {
         id: scenario.id.clone(),
@@ -2059,6 +2427,10 @@ pub fn run_single_scenario(
             run_forgetting(scenario, workspace, kimetsu_bin, cfg.budget_tokens)
         }
         Dimension::Calibration => run_calibration(scenario, workspace, kimetsu_bin),
+        Dimension::Poisoning => {
+            run_poisoning(scenario, workspace, kimetsu_bin, cfg.budget_tokens)
+        }
+        Dimension::RenderContract => run_render_contract(scenario, workspace, kimetsu_bin),
         Dimension::WritePrecision => run_write_precision(
             scenario,
             workspace,
@@ -2251,6 +2623,8 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 calibration: None,
                 ages: std::collections::HashMap::new(),
                 transcript: vec![],
+                poisoning: None,
+                render_contract: None,
                 write_gold: vec![],
             },
             Scenario {
@@ -2286,6 +2660,8 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 calibration: None,
                 ages: std::collections::HashMap::new(),
                 transcript: vec![],
+                poisoning: None,
+                render_contract: None,
                 write_gold: vec![],
             },
             Scenario {
@@ -2327,6 +2703,8 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 calibration: None,
                 ages: std::collections::HashMap::new(),
                 transcript: vec![],
+                poisoning: None,
+                render_contract: None,
                 write_gold: vec![],
             },
             Scenario {
@@ -2368,6 +2746,8 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 calibration: None,
                 ages: std::collections::HashMap::new(),
                 transcript: vec![],
+                poisoning: None,
+                render_contract: None,
                 write_gold: vec![],
             },
         ],
