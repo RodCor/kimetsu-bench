@@ -1043,10 +1043,30 @@ fn parse_harbor_result(
         #[serde(default)]
         exception_stats: std::collections::BTreeMap<String, Vec<String>>,
     }
+    /// Harbor does not use one metric shape for every suite.
+    ///
+    /// Terminal-Bench emits an aggregate: `{"mean": 1.0}`. DeepSWE emits the
+    /// grader's named fields instead: `{"reward": 1.0, "f2p": 1.0, "p2p": 1.0,
+    /// "partial": 1.0, ...}` with no `mean` at all. Reading only `mean` yields
+    /// `None` for every DeepSWE task, which scores 0.0 — so a fully successful
+    /// run reports `✗ 0.00` on all 113 tasks while `reward: 1.0` sits in the
+    /// file. Another wrong answer that reads exactly like a real result.
+    ///
+    /// `reward` is the right fallback rather than `partial`: it is the binary
+    /// pass/fail the suite is scored on, and kbench runs one trial per task per
+    /// agent, so there is nothing for a mean to average over.
     #[derive(Deserialize)]
     struct MetricEntry {
         #[serde(default)]
         mean: Option<f64>,
+        #[serde(default)]
+        reward: Option<f64>,
+    }
+
+    impl MetricEntry {
+        fn score(&self) -> Option<f64> {
+            self.mean.or(self.reward)
+        }
     }
 
     let r: HarborResult = serde_json::from_slice(bytes).map_err(|e| {
@@ -1071,7 +1091,7 @@ fn parse_harbor_result(
     // Score = average of all eval means. Missing / empty metrics → 0.
     let mut means: Vec<f64> = Vec::new();
     for entry in stats.evals.values() {
-        if let Some(m) = entry.metrics.first().and_then(|m| m.mean) {
+        if let Some(m) = entry.metrics.first().and_then(MetricEntry::score) {
             means.push(m);
         }
     }
@@ -1347,6 +1367,83 @@ mod tests {
         assert!(
             msg.contains("result.json was not valid JSON"),
             "expected helpful context; got: {msg}"
+        );
+    }
+
+    /// The DeepSWE metric shape, copied verbatim from a real run's job-level
+    /// result.json. Before the `reward` fallback this scored 0.00 while the
+    /// task had in fact passed 44/44 fail-to-pass tests.
+    #[test]
+    fn deepswe_named_metrics_are_scored_not_silently_zeroed() {
+        let bytes = br#"{
+            "n_total_trials": 1,
+            "stats": {
+                "n_completed_trials": 1,
+                "n_errored_trials": 0,
+                "n_cancelled_trials": 0,
+                "evals": {
+                    "claude-code__tasks": {
+                        "n_trials": 1,
+                        "n_errors": 0,
+                        "metrics": [{
+                            "f2p": 1.0, "f2p_passed": 44.0, "f2p_total": 44.0,
+                            "p2p": 1.0, "p2p_passed": 2738.0, "p2p_total": 2738.0,
+                            "partial": 1.0, "reward": 1.0
+                        }]
+                    }
+                }
+            }
+        }"#;
+        let g = parse_harbor_result(bytes, TaskId("adaptix".into()), AgentConfig::ClaudeAlone)
+            .expect("DeepSWE metrics must parse");
+        assert_eq!(
+            g.score, 1.0,
+            "reward 1.0 must not be reported as 0.00; reason: {:?}",
+            g.reason
+        );
+    }
+
+    /// A DeepSWE loss must still be a loss — the fallback must not turn every
+    /// task into a pass.
+    #[test]
+    fn deepswe_zero_reward_stays_a_loss() {
+        let bytes = br#"{
+            "n_total_trials": 1,
+            "stats": {
+                "n_completed_trials": 1, "n_errored_trials": 0, "n_cancelled_trials": 0,
+                "evals": { "claude-code__tasks": {
+                    "n_trials": 1, "n_errors": 0,
+                    "metrics": [{ "reward": 0.0, "f2p": 0.0, "partial": 0.59 }]
+                }}
+            }
+        }"#;
+        let g = parse_harbor_result(bytes, TaskId("t".into()), AgentConfig::ClaudeAlone)
+            .expect("parse");
+        assert_eq!(
+            g.score, 0.0,
+            "partial credit must not be promoted to a pass"
+        );
+    }
+
+    /// Terminal-Bench's `mean` shape must keep working, and must win over
+    /// `reward` when both are present.
+    #[test]
+    fn terminal_bench_mean_still_takes_precedence() {
+        let bytes = br#"{
+            "n_total_trials": 1,
+            "stats": {
+                "n_completed_trials": 1, "n_errored_trials": 0, "n_cancelled_trials": 0,
+                "evals": { "terminal-bench__x": {
+                    "n_trials": 1, "n_errors": 0,
+                    "metrics": [{ "mean": 1.0, "reward": 0.0 }]
+                }}
+            }
+        }"#;
+        let g = parse_harbor_result(bytes, TaskId("t".into()), AgentConfig::ClaudeAlone)
+            .expect("parse");
+        assert_eq!(
+            g.score, 1.0,
+            "`mean` is the aggregate and must be preferred"
         );
     }
 
