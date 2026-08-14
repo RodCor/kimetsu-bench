@@ -104,6 +104,29 @@ pub enum Dimension {
     Calibration,
     WritePrecision,
     Graph,
+    /// v2.6: does the brain resist a poisoned/imported corpus? Reader-free by
+    /// construction — every assertion has one deterministic right answer:
+    /// trust-weighted ranking (4a), import quarantine (4b), and `brain audit`
+    /// write-burst detection. Tests shipped mechanisms, not model behaviour.
+    Poisoning,
+    /// v2.6: does the rendered bundle carry the contract a reader needs?
+    ///
+    /// **This is deliberately NOT called "sycophancy".** MemSyco-Bench measures
+    /// a *reader* over-deferring to memory against evidence in front of it, and
+    /// BrainBench has no reader — so that property is not measurable here. What
+    /// is measurable is whether the injected text contains the preconditions
+    /// for not deferring: the prior-conclusion framing, the conflict rule, the
+    /// dates on an ordering query, the "does not cover" line. A high score here
+    /// means the contract is intact, NOT that the brain resists sycophancy.
+    RenderContract,
+    /// v2.7: does the brain surface the RIGHT memory at the RIGHT moment across
+    /// an ordered stream of tasks? One persistent brain per scenario; each
+    /// episode queries before its "work", then feeds back citations and newly
+    /// recorded lessons so later episodes can (and must) benefit from earlier
+    /// ones. Measures useful-hit rate, false injections on episodes where the
+    /// correct behavior is to stay silent, stale resolution across updates
+    /// recorded mid-stream, and the learning curve over stream position.
+    Workflow,
 }
 
 impl Dimension {
@@ -115,7 +138,10 @@ impl Dimension {
             Dimension::Forgetting => "forgetting",
             Dimension::Calibration => "calibration",
             Dimension::WritePrecision => "write-precision",
+            Dimension::Poisoning => "poisoning",
+            Dimension::RenderContract => "render-contract",
             Dimension::Graph => "graph",
+            Dimension::Workflow => "workflow",
         }
     }
 }
@@ -130,10 +156,13 @@ impl FromStr for Dimension {
             "forgetting" => Ok(Dimension::Forgetting),
             "calibration" => Ok(Dimension::Calibration),
             "write-precision" | "writeprecision" => Ok(Dimension::WritePrecision),
+            "poisoning" => Ok(Dimension::Poisoning),
+            "render-contract" | "rendercontract" | "framing" => Ok(Dimension::RenderContract),
             "graph" => Ok(Dimension::Graph),
+            "workflow" => Ok(Dimension::Workflow),
             other => Err(format!(
                 "unknown dimension `{other}`; expected one of: retrieval, dedup, \
-                 importance, forgetting, calibration, write-precision, graph"
+                 importance, forgetting, calibration, write-precision, graph, workflow"
             )),
         }
     }
@@ -239,6 +268,61 @@ pub struct GoldLesson {
     pub keywords: Vec<String>,
 }
 
+/// One step of a workflow stream. The broker is queried with `task` BEFORE the
+/// episode's "work", scored against gold, and then the episode's outcome is
+/// fed back — `cite`d memories gain usefulness, `record`ed lessons become
+/// retrievable — so LATER episodes see the consequences.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkflowEpisode {
+    /// Task description used as the broker query for this episode.
+    pub task: String,
+    /// Keys (seeded, or recorded by an earlier episode) that SHOULD surface.
+    /// Empty = gold abstention: the correct behavior is to inject nothing, and
+    /// any fixture memory in the top_k counts as a false injection.
+    #[serde(default)]
+    pub relevant: Vec<String>,
+    /// Keys of superseded memories that must NOT outrank the `relevant` ones
+    /// (knowledge updated by a LATER episode's `record`).
+    #[serde(default)]
+    pub stale: Vec<String>,
+    /// Keys the simulated agent cites after this episode — the usefulness
+    /// feedback that should promote these memories for later episodes. A key
+    /// may appear multiple times; each occurrence applies one citation, so an
+    /// entrenched-incumbent stream can deepen a memory's promotion.
+    #[serde(default)]
+    pub cite: Vec<String>,
+    /// Trap keys: memories that are lexically/semantically NEAR the task but
+    /// are NOT the answer. The episode fails (score 0) when any of them
+    /// outranks the best `relevant` key — a trap being selected over the truth
+    /// is precision failure, not noise.
+    #[serde(default)]
+    pub forbidden: Vec<String>,
+    /// Lessons recorded after this episode; retrievable from the next one on.
+    #[serde(default)]
+    pub record: Vec<Memory>,
+    /// Memories imported after this episode as a PACK (export→import round
+    /// trip, `--no-quarantine`), so they carry pack provenance and the origin
+    /// trust discount. Retrievable from the next episode on.
+    #[serde(default)]
+    pub pack: Vec<Memory>,
+    /// Cut-off rank for hit / false-injection scoring.
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+}
+
+/// Workflow-dimension spec: an ordered episode stream over ONE persistent
+/// brain. Unlike `queries` (independent probes against a fixed corpus),
+/// episodes are stateful: what one records changes what the next can retrieve.
+/// This is the reader-free analogue of an agent carrying its brain across a
+/// work session — the thing the static dimensions cannot measure.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkflowSpec {
+    /// Memories present before episode 1 (prior knowledge and distractors).
+    #[serde(default)]
+    pub seed: Vec<Memory>,
+    pub episodes: Vec<WorkflowEpisode>,
+}
+
 /// One authored scenario.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Scenario {
@@ -268,12 +352,21 @@ pub struct Scenario {
     /// forgetting). Applied via `brain memory set-age`.
     #[serde(default)]
     pub ages: std::collections::HashMap<String, u32>,
+    /// Poisoning-track spec (see [`PoisoningSpec`]).
+    #[serde(default)]
+    pub poisoning: Option<PoisoningSpec>,
+    /// Render-contract spec (see [`RenderContractSpec`]).
+    #[serde(default)]
+    pub render_contract: Option<RenderContractSpec>,
     /// Transcript fed to `brain distill` for write-precision scenarios.
     #[serde(default)]
     pub transcript: Vec<TranscriptTurn>,
     /// Gold lessons the distiller should capture (write-precision scenarios).
     #[serde(default)]
     pub write_gold: Vec<GoldLesson>,
+    /// Workflow-stream spec (see [`WorkflowSpec`]).
+    #[serde(default)]
+    pub workflow: Option<WorkflowSpec>,
 }
 
 /// A reference to an external EvalFixture file (LongMemEval-style) to import as
@@ -305,6 +398,45 @@ pub struct CalibrationGenSpec {
     /// id prefix for synthesized scenarios (default "calib-gen").
     #[serde(default)]
     pub id_prefix: String,
+}
+
+/// Directive to SYNTHESIZE workflow-stream scenarios from an EvalFixture pool,
+/// so the workflow dimension reaches release-grade case counts without
+/// hand-authoring thousands of episode streams. Fully deterministic
+/// (index-derived) so the dataset is identical run-to-run.
+///
+/// Three stream shapes are composed, cycling by scenario index over whichever
+/// the pool supports:
+///   - **record→re-query transfer**: the SAME task string appears as an
+///     abstention episode before its lesson is recorded and as a gold episode
+///     after — the sharpest possible before/after pair;
+///   - **paraphrase transfer under noise**: a lesson is recorded under one pool
+///     case's phrasing and probed later with a DIFFERENT case that shares a
+///     relevant key, while noise memories accumulate around it (requires a
+///     pool with multiple cases per memory);
+///   - **knowledge update**: the superseded memory is recorded (and cited —
+///     it WAS the right answer at the time) before the update lands, and the
+///     final query must rank new over old (requires pool cases with `stale`
+///     labels, e.g. dataset-correctness.json).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkflowGenSpec {
+    /// Pool fixture file (EvalFixtureFile shape). Resolved relative to the
+    /// dataset file's directory.
+    pub source: String,
+    /// Number of scenarios to synthesize.
+    pub count: usize,
+    /// id prefix for synthesized scenarios (default "wf-gen").
+    #[serde(default)]
+    pub id_prefix: String,
+    /// Background-corpus size: this many additional unrelated pool memories
+    /// are seeded into every scenario's brain, so retrieval happens against a
+    /// realistic haystack instead of a handful of fixtures. Background picks
+    /// exclude every key the scenario references AND the relevant keys of any
+    /// case whose query is used as an abstention task (otherwise "silence is
+    /// correct" would be false). 0 (the default) preserves the tiny-corpus
+    /// behavior.
+    #[serde(default)]
+    pub background: usize,
 }
 
 /// On-disk EvalFixture file: a bag of memories plus gold-labeled retrieval
@@ -346,6 +478,10 @@ pub struct BrainBenchDataset {
     /// at load time (release-grade case counts). None (the default) is a no-op.
     #[serde(default)]
     pub calibration_gen: Option<CalibrationGenSpec>,
+    /// Directives to synthesize workflow-stream scenarios from memory pools at
+    /// load time. Empty (the default) is a no-op.
+    #[serde(default)]
+    pub workflow_gen: Vec<WorkflowGenSpec>,
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -375,6 +511,9 @@ pub struct BrainBenchConfig {
     /// Cheap-model id written into the workspace `[cheap_model]` table for
     /// write-precision scenarios.
     pub distill_model: String,
+    /// Worker threads for scenario execution (each scenario already runs in an
+    /// isolated temp workspace, so parallelism is safe). 0/1 = sequential.
+    pub jobs: usize,
 }
 
 impl BrainBenchConfig {
@@ -423,6 +562,52 @@ impl std::fmt::Display for BrainBenchError {
 impl std::error::Error for BrainBenchError {}
 
 // ─── Result + Report types ───────────────────────────────────────────────────
+
+/// v2.6: poisoning-resistance spec. Every field maps to a shipped mechanism.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PoisoningSpec {
+    /// Memories introduced as an imported *pack* rather than authored locally,
+    /// so they carry pack provenance and the 4a trust discount.
+    #[serde(default)]
+    pub pack: Vec<Memory>,
+    /// Import the pack held in the review queue (what an `http(s)://` source
+    /// gets by default). Quarantined memories must not reach retrieval at all.
+    #[serde(default)]
+    pub quarantine: bool,
+    /// Query used to inspect ranking once everything is ingested.
+    #[serde(default)]
+    pub query: String,
+    /// Fixture keys that must NOT appear in the bundle — the quarantine and
+    /// "a poisoned memory never silently wins" assertions.
+    #[serde(default)]
+    pub must_not_retrieve: Vec<String>,
+    /// Fixture keys that must outrank every `pack` entry. Corroboration (a
+    /// citation from a successful local run) is what erases the origin
+    /// discount, so scenarios pair this with `cite`.
+    #[serde(default)]
+    pub must_outrank: Vec<String>,
+    /// Minimum number of write bursts `brain audit` must flag. A burst is the
+    /// shape both a bulk import and induced poisoning leave behind.
+    #[serde(default)]
+    pub expect_bursts: usize,
+}
+
+/// v2.6: render-contract spec — what the *injected text* must and must not say.
+///
+/// Not a sycophancy measurement; see [`Dimension::RenderContract`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RenderContractSpec {
+    /// Query whose rendered bundle is inspected.
+    pub query: String,
+    /// Substrings the rendered context must contain (framing, conflict rule,
+    /// a date, the uncovered-terms line).
+    #[serde(default)]
+    pub must_contain: Vec<String>,
+    /// Substrings it must not contain — hedges that tell the agent to distrust
+    /// memory outright, which costs more than the sycophancy it prevents.
+    #[serde(default)]
+    pub must_not_contain: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioResult {
@@ -633,6 +818,78 @@ pub fn resolution_correct(ranked: &[String], relevant: &[String], stale: &[Strin
     }
 }
 
+/// Outcome of scoring one workflow episode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EpisodeScore {
+    /// 0.0–1.0 episode score.
+    pub score: f64,
+    /// An abstention episode where a fixture memory surfaced anyway.
+    pub false_injection: bool,
+    /// A `forbidden` (trap) key outranked the best relevant key — the broker
+    /// selected a near-miss over the truth.
+    pub trap_hit: bool,
+}
+
+/// Score one workflow episode from its ranked retrieval.
+///
+/// Gold episodes (`relevant` non-empty): recall@k, gated by resolution when a
+/// `stale` key is planted (same rule as the retrieval dimension), and gated to
+/// 0.0 when any `forbidden` trap key outranks the best relevant key.
+///
+/// Abstention episodes (`relevant` empty): the correct behavior is silence.
+/// 1.0 iff no fixture memory appears within the top `k`; anything surfacing is
+/// a false injection (a surfacing `forbidden` key additionally counts as a
+/// trap hit).
+pub fn score_workflow_episode(
+    ranked: &[String],
+    relevant: &[String],
+    stale: &[String],
+    forbidden: &[String],
+    k: usize,
+) -> EpisodeScore {
+    let top = &ranked[..k.min(ranked.len())];
+    if relevant.is_empty() {
+        let injected = !top.is_empty();
+        let trap_hit = top.iter().any(|r| forbidden.iter().any(|f| f == r));
+        return EpisodeScore {
+            score: if injected { 0.0 } else { 1.0 },
+            false_injection: injected,
+            trap_hit,
+        };
+    }
+    let best_relevant = ranked
+        .iter()
+        .position(|r| relevant.iter().any(|rel| rel == r));
+    let best_forbidden = ranked.iter().position(|r| forbidden.iter().any(|f| f == r));
+    // A trap wins when it outranks the truth, or when it surfaces in the
+    // top-k while the truth is absent entirely.
+    let trap_hit = match (best_forbidden, best_relevant) {
+        (Some(f), Some(r)) => f < r,
+        (Some(f), None) => f < k.min(ranked.len()),
+        (None, _) => false,
+    };
+    let r = recall_at_k(ranked, relevant, k);
+    let resolution_ok = stale.is_empty() || resolution_correct(ranked, relevant, stale);
+    let score = if trap_hit || !resolution_ok { 0.0 } else { r };
+    EpisodeScore {
+        score,
+        false_injection: false,
+        trap_hit,
+    }
+}
+
+/// Learning curve over gold-episode scores in stream order: mean of the first
+/// half vs mean of the second half (odd length puts the middle episode in the
+/// second half). With fewer than 2 gold episodes both halves equal the mean.
+pub fn learning_curve(gold_scores: &[f64]) -> (f64, f64) {
+    if gold_scores.len() < 2 {
+        let m = mean(gold_scores);
+        return (m, m);
+    }
+    let mid = gold_scores.len() / 2;
+    (mean(&gold_scores[..mid]), mean(&gold_scores[mid..]))
+}
+
 // ─── Dataset loading + filtering ─────────────────────────────────────────────
 
 /// Load and parse a BrainBench dataset JSON file.
@@ -749,7 +1006,10 @@ pub fn expand_eval_fixtures(
                 calibration: None,
                 ages: std::collections::HashMap::new(),
                 transcript: vec![],
+                poisoning: None,
+                render_contract: None,
                 write_gold: vec![],
+                workflow: None,
             });
         }
     }
@@ -852,7 +1112,644 @@ pub fn expand_calibration_gen(
             }),
             ages: std::collections::HashMap::new(),
             transcript: vec![],
+            poisoning: None,
+            render_contract: None,
             write_gold: vec![],
+            workflow: None,
+        });
+    }
+    Ok(out)
+}
+
+/// Generic filler tasks used for abstention episodes when the pool is too
+/// entangled to yield a query with no key overlap. Deliberately mundane and
+/// far from any plausible dev-lesson content.
+const WF_FILLER_TASKS: [&str; 4] = [
+    "Write the weekly status update for the team meeting",
+    "Schedule the quarterly planning session and book a room",
+    "Proofread the conference talk abstract for typos",
+    "Collect lunch orders for the offsite next Friday",
+];
+
+/// Lowercased words of length >= 4 — the overlap vocabulary used to mine
+/// near-miss trap memories for a query.
+fn content_words(s: &str) -> std::collections::HashSet<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 4)
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Synthesize workflow-stream scenarios from an EvalFixture pool (see
+/// [`WorkflowGenSpec`]). Deterministic: scenario `i` derives every pick from
+/// `i` and fixed pool strides, so the dataset is identical run-to-run.
+pub fn expand_workflow_gen(
+    spec: &WorkflowGenSpec,
+    base_dir: &Path,
+) -> Result<Vec<Scenario>, BrainBenchError> {
+    let path = base_dir.join(&spec.source);
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        BrainBenchError::DatasetLoad(format!(
+            "could not read workflow pool {}: {e}",
+            path.display()
+        ))
+    })?;
+    let fixture: EvalFixtureFile = serde_json::from_str(&content).map_err(|e| {
+        BrainBenchError::DatasetParse(format!(
+            "JSON parse failed for workflow pool {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    let mem_text_by_key: std::collections::HashMap<String, String> = fixture
+        .memories
+        .iter()
+        .map(|m| (m.key.clone(), m.text.clone()))
+        .collect();
+    let resolvable = |keys: &[String]| keys.iter().all(|k| mem_text_by_key.contains_key(k));
+
+    // Plain cases: at least one relevant key, all keys resolvable. Update
+    // cases additionally carry resolvable stale keys.
+    let plain: Vec<&EvalFixCase> = fixture
+        .cases
+        .iter()
+        .filter(|c| !c.relevant.is_empty() && resolvable(&c.relevant) && c.stale.is_empty())
+        .collect();
+    let update: Vec<&EvalFixCase> = fixture
+        .cases
+        .iter()
+        .filter(|c| {
+            !c.relevant.is_empty()
+                && !c.stale.is_empty()
+                && resolvable(&c.relevant)
+                && resolvable(&c.stale)
+        })
+        .collect();
+    if plain.is_empty() && update.is_empty() {
+        return Err(BrainBenchError::DatasetLoad(format!(
+            "workflow pool {} has no usable cases (relevant keys must resolve to pool memories)",
+            path.display()
+        )));
+    }
+
+    // Paraphrase pairs: distinct plain cases sharing >=1 relevant key with
+    // different query text — two genuine phrasings of the same need.
+    let mut cases_by_key: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, c) in plain.iter().enumerate() {
+        for k in &c.relevant {
+            cases_by_key.entry(k.as_str()).or_default().push(i);
+        }
+    }
+    let mut pair_set: std::collections::BTreeSet<(usize, usize)> =
+        std::collections::BTreeSet::new();
+    for idxs in cases_by_key.values() {
+        for a in 0..idxs.len() {
+            for b in (a + 1)..idxs.len() {
+                let (x, y) = (idxs[a].min(idxs[b]), idxs[a].max(idxs[b]));
+                if plain[x].query != plain[y].query {
+                    pair_set.insert((x, y));
+                }
+            }
+        }
+    }
+    let pairs: Vec<(usize, usize)> = pair_set.into_iter().collect();
+
+    // Variant cycle over what the pool supports: 0 = record→re-query,
+    // 1 = paraphrase-under-noise, 2 = knowledge update, 3 = semantic trap,
+    // 4 = poisoned pack, 5 = entrenched incumbent.
+    let mut cycle: Vec<u8> = Vec::new();
+    if !plain.is_empty() {
+        cycle.push(0);
+    }
+    if !pairs.is_empty() {
+        cycle.push(1);
+    }
+    if !update.is_empty() {
+        cycle.push(2);
+    }
+    if !plain.is_empty() {
+        cycle.push(3);
+        cycle.push(4);
+    }
+    if !update.is_empty() {
+        cycle.push(5);
+    }
+
+    let prefix = if spec.id_prefix.is_empty() {
+        "wf-gen"
+    } else {
+        spec.id_prefix.as_str()
+    };
+
+    // First plain case starting at `start` whose relevant keys avoid
+    // `exclude_keys` and whose query differs from `exclude_queries`.
+    let pick_case = |start: usize,
+                     exclude_keys: &std::collections::HashSet<String>,
+                     exclude_queries: &std::collections::HashSet<String>|
+     -> Option<&EvalFixCase> {
+        let n = plain.len();
+        if n == 0 {
+            return None;
+        }
+        for t in 0..n {
+            let c = plain[(start + t) % n];
+            if c.relevant.iter().any(|k| exclude_keys.contains(k)) {
+                continue;
+            }
+            if exclude_queries.contains(&c.query) {
+                continue;
+            }
+            return Some(c);
+        }
+        None
+    };
+    let mems_for =
+        |keys: &[String], taken: &mut std::collections::HashSet<String>| -> Vec<Memory> {
+            keys.iter()
+                .filter(|k| taken.insert((*k).clone()))
+                .map(|k| Memory {
+                    key: k.clone(),
+                    text: mem_text_by_key[k].clone(),
+                    scope: default_scope(),
+                    kind: default_kind(),
+                })
+                .collect()
+        };
+    // Near-miss traps for a query: the non-excluded pool memories sharing the
+    // MOST content words with it — lexically seductive, deliberately wrong.
+    // Deterministic: overlap desc, pool index asc.
+    let pick_traps =
+        |query: &str, exclude_keys: &std::collections::HashSet<String>, n: usize| -> Vec<String> {
+            let qw = content_words(query);
+            let mut scored: Vec<(usize, usize)> = fixture
+                .memories
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| !exclude_keys.contains(&m.key))
+                .filter_map(|(idx, m)| {
+                    let overlap = content_words(&m.text).intersection(&qw).count();
+                    (overlap > 0).then_some((overlap, idx))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            scored
+                .into_iter()
+                .take(n)
+                .map(|(_, idx)| fixture.memories[idx].key.clone())
+                .collect()
+        };
+
+    let mut out: Vec<Scenario> = Vec::with_capacity(spec.count);
+    for i in 0..spec.count {
+        let variant = cycle[i % cycle.len()];
+        let np = plain.len().max(1);
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut exclude_q: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Keys that must stay OUT of the background haystack: the relevant
+        // keys of any case whose query is used as an abstention task.
+        let mut ban: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let (desc, tier, mut seed, episodes) = match variant {
+            0 => {
+                // record→re-query transfer: same task string before/after.
+                let a = plain[i % np];
+                let a_keys: std::collections::HashSet<String> =
+                    a.relevant.iter().cloned().collect();
+                exclude_q.insert(a.query.clone());
+                let d = pick_case(i + np / 3, &a_keys, &exclude_q);
+                let mut seed_keys = a_keys.clone();
+                let mut seed: Vec<Memory> = Vec::new();
+                let mut seed_taken = std::collections::HashSet::new();
+                if let Some(d) = d {
+                    seed_keys.extend(d.relevant.iter().cloned());
+                    exclude_q.insert(d.query.clone());
+                    seed.extend(mems_for(&d.relevant, &mut seed_taken));
+                }
+                let e = pick_case(i + 2 * np / 3, &seed_keys, &exclude_q);
+                if let Some(e) = e {
+                    seed.extend(mems_for(&e.relevant, &mut seed_taken));
+                }
+                taken.extend(seed_taken);
+                let record_a = mems_for(&a.relevant, &mut taken);
+                let mut eps = vec![WorkflowEpisode {
+                    task: a.query.clone(),
+                    relevant: vec![],
+                    stale: vec![],
+                    cite: vec![],
+                    forbidden: vec![],
+                    record: record_a,
+                    pack: vec![],
+                    top_k: default_top_k(),
+                }];
+                if let Some(d) = d {
+                    eps.push(WorkflowEpisode {
+                        task: d.query.clone(),
+                        relevant: d.relevant.clone(),
+                        stale: vec![],
+                        cite: d.relevant.clone(),
+                        forbidden: vec![],
+                        record: vec![],
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    });
+                }
+                eps.push(WorkflowEpisode {
+                    task: a.query.clone(),
+                    relevant: a.relevant.clone(),
+                    stale: vec![],
+                    cite: a.relevant.clone(),
+                    forbidden: vec![],
+                    record: vec![],
+                    pack: vec![],
+                    top_k: default_top_k(),
+                });
+                (
+                    "generated: record→re-query transfer (same task before/after the lesson)",
+                    Tier::Medium,
+                    seed,
+                    eps,
+                )
+            }
+            1 => {
+                // Paraphrase transfer under accumulating noise.
+                let (ai, bi) = pairs[i % pairs.len()];
+                let (a, b) = (plain[ai], plain[bi]);
+                let mut gold_keys: std::collections::HashSet<String> =
+                    a.relevant.iter().cloned().collect();
+                gold_keys.extend(b.relevant.iter().cloned());
+                exclude_q.insert(a.query.clone());
+                exclude_q.insert(b.query.clone());
+                let n1 = pick_case(i + np / 4, &gold_keys, &exclude_q);
+                let mut used = gold_keys.clone();
+                if let Some(n1) = n1 {
+                    used.extend(n1.relevant.iter().cloned());
+                    exclude_q.insert(n1.query.clone());
+                }
+                let n2 = pick_case(i + np / 2, &used, &exclude_q);
+                if let Some(n2) = n2 {
+                    used.extend(n2.relevant.iter().cloned());
+                    exclude_q.insert(n2.query.clone());
+                    ban.extend(n2.relevant.iter().cloned());
+                }
+                let n3 = pick_case(i + 3 * np / 4, &used, &exclude_q);
+
+                let mut record1 = mems_for(&a.relevant, &mut taken);
+                record1.extend(mems_for(&b.relevant, &mut taken));
+                if let Some(n1) = n1 {
+                    record1.extend(mems_for(&n1.relevant, &mut taken));
+                }
+                let record2 = match n3 {
+                    Some(n3) => mems_for(&n3.relevant, &mut taken),
+                    None => vec![],
+                };
+                let abst_task = n2
+                    .map(|c| c.query.clone())
+                    .unwrap_or_else(|| WF_FILLER_TASKS[i % WF_FILLER_TASKS.len()].to_string());
+                let eps = vec![
+                    WorkflowEpisode {
+                        task: a.query.clone(),
+                        relevant: vec![],
+                        stale: vec![],
+                        cite: vec![],
+                        forbidden: vec![],
+                        record: record1,
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: abst_task,
+                        relevant: vec![],
+                        stale: vec![],
+                        cite: vec![],
+                        forbidden: vec![],
+                        record: record2,
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: b.query.clone(),
+                        relevant: b.relevant.clone(),
+                        stale: vec![],
+                        cite: b.relevant.clone(),
+                        forbidden: vec![],
+                        record: vec![],
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                ];
+                (
+                    "generated: paraphrase transfer under noise (different phrasing, shared key)",
+                    Tier::Hard,
+                    vec![],
+                    eps,
+                )
+            }
+            2 => {
+                // Knowledge update: old recorded (and cited — it WAS right),
+                // update recorded later, final query must rank new over old.
+                let s = update[i % update.len()];
+                let mut s_keys: std::collections::HashSet<String> =
+                    s.relevant.iter().cloned().collect();
+                s_keys.extend(s.stale.iter().cloned());
+                exclude_q.insert(s.query.clone());
+                let n2 = pick_case(i + np / 2, &s_keys, &exclude_q);
+                let mut seed_taken = std::collections::HashSet::new();
+                let seed = match n2 {
+                    Some(n2) => {
+                        exclude_q.insert(n2.query.clone());
+                        mems_for(&n2.relevant, &mut seed_taken)
+                    }
+                    None => vec![],
+                };
+                taken.extend(seed_taken);
+                let mut used = s_keys.clone();
+                if let Some(n2) = n2 {
+                    used.extend(n2.relevant.iter().cloned());
+                }
+                let n1 = pick_case(i + np / 3, &used, &exclude_q);
+                if let Some(n1) = n1 {
+                    ban.extend(n1.relevant.iter().cloned());
+                }
+                let old_mems = mems_for(&s.stale, &mut taken);
+                let new_mems = mems_for(&s.relevant, &mut taken);
+                let abst_task = n1
+                    .map(|c| c.query.clone())
+                    .unwrap_or_else(|| WF_FILLER_TASKS[i % WF_FILLER_TASKS.len()].to_string());
+                let eps = vec![
+                    WorkflowEpisode {
+                        task: s.query.clone(),
+                        relevant: vec![],
+                        stale: vec![],
+                        cite: vec![],
+                        forbidden: vec![],
+                        record: old_mems,
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: s.query.clone(),
+                        relevant: s.stale.clone(),
+                        stale: vec![],
+                        cite: s.stale.clone(),
+                        forbidden: vec![],
+                        record: vec![],
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: abst_task,
+                        relevant: vec![],
+                        stale: vec![],
+                        cite: vec![],
+                        forbidden: vec![],
+                        record: new_mems,
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: s.query.clone(),
+                        relevant: s.relevant.clone(),
+                        stale: s.stale.clone(),
+                        cite: s.relevant.clone(),
+                        forbidden: vec![],
+                        record: vec![],
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                ];
+                (
+                    "generated: knowledge update (old cited before the update lands; new must outrank old)",
+                    Tier::Hard,
+                    seed,
+                    eps,
+                )
+            }
+            3 => {
+                // Semantic trap: seed the pool memories that share the MOST
+                // vocabulary with the task while not being the answer. The
+                // truth is recorded mid-stream and must outrank every trap —
+                // before and after being cited.
+                let a = plain[i % np];
+                let a_keys: std::collections::HashSet<String> =
+                    a.relevant.iter().cloned().collect();
+                let trap_keys = pick_traps(&a.query, &a_keys, 3);
+                let mut seed_taken = std::collections::HashSet::new();
+                let seed = mems_for(&trap_keys, &mut seed_taken);
+                taken.extend(seed_taken);
+                let record_a = mems_for(&a.relevant, &mut taken);
+                let eps = vec![
+                    WorkflowEpisode {
+                        task: a.query.clone(),
+                        relevant: vec![],
+                        stale: vec![],
+                        cite: vec![],
+                        forbidden: trap_keys.clone(),
+                        record: record_a,
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: a.query.clone(),
+                        relevant: a.relevant.clone(),
+                        stale: vec![],
+                        cite: a.relevant.clone(),
+                        forbidden: trap_keys.clone(),
+                        record: vec![],
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: a.query.clone(),
+                        relevant: a.relevant.clone(),
+                        stale: vec![],
+                        cite: a.relevant.clone(),
+                        forbidden: trap_keys,
+                        record: vec![],
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                ];
+                (
+                    "generated: semantic trap — max-overlap near-misses must never outrank the recorded truth",
+                    Tier::Hard,
+                    seed,
+                    eps,
+                )
+            }
+            4 => {
+                // Poisoned pack: near-miss content arrives mid-stream via a
+                // pack import (provenance trust discount) AFTER the local
+                // lesson was earned and cited. Pack content must not outrank
+                // the earned lesson.
+                let a = plain[(i + np / 2) % np];
+                let a_keys: std::collections::HashSet<String> =
+                    a.relevant.iter().cloned().collect();
+                let trap_keys = pick_traps(&a.query, &a_keys, 3);
+                let record_a = mems_for(&a.relevant, &mut taken);
+                let pack_mems = mems_for(&trap_keys, &mut taken);
+                let eps = vec![
+                    WorkflowEpisode {
+                        task: a.query.clone(),
+                        relevant: vec![],
+                        stale: vec![],
+                        cite: vec![],
+                        forbidden: vec![],
+                        record: record_a,
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: a.query.clone(),
+                        relevant: a.relevant.clone(),
+                        stale: vec![],
+                        cite: a.relevant.clone(),
+                        forbidden: vec![],
+                        record: vec![],
+                        pack: pack_mems,
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: a.query.clone(),
+                        relevant: a.relevant.clone(),
+                        stale: vec![],
+                        cite: a.relevant.clone(),
+                        forbidden: trap_keys,
+                        record: vec![],
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                ];
+                (
+                    "generated: poisoned pack — imported near-misses must not outrank the earned, cited lesson",
+                    Tier::Complex,
+                    vec![],
+                    eps,
+                )
+            }
+            _ => {
+                // Entrenched incumbent: the OLD memory is cited several times
+                // (it genuinely helped, once) BEFORE the better replacement
+                // lands. Usefulness promotion must not drown the update.
+                let s = update[i % update.len()];
+                let depth = [3usize, 5, 8][(i / cycle.len().max(1)) % 3];
+                let mut s_keys: std::collections::HashSet<String> =
+                    s.relevant.iter().cloned().collect();
+                s_keys.extend(s.stale.iter().cloned());
+                exclude_q.insert(s.query.clone());
+                let n1 = pick_case(i + np / 3, &s_keys, &exclude_q);
+                if let Some(n1) = n1 {
+                    ban.extend(n1.relevant.iter().cloned());
+                }
+                let old_mems = mems_for(&s.stale, &mut taken);
+                let new_mems = mems_for(&s.relevant, &mut taken);
+                let entrench: Vec<String> =
+                    (0..depth).flat_map(|_| s.stale.iter().cloned()).collect();
+                let abst_task = n1
+                    .map(|c| c.query.clone())
+                    .unwrap_or_else(|| WF_FILLER_TASKS[i % WF_FILLER_TASKS.len()].to_string());
+                let eps = vec![
+                    WorkflowEpisode {
+                        task: s.query.clone(),
+                        relevant: vec![],
+                        stale: vec![],
+                        cite: vec![],
+                        forbidden: vec![],
+                        record: old_mems,
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: s.query.clone(),
+                        relevant: s.stale.clone(),
+                        stale: vec![],
+                        cite: entrench,
+                        forbidden: vec![],
+                        record: vec![],
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: abst_task,
+                        relevant: vec![],
+                        stale: vec![],
+                        cite: vec![],
+                        forbidden: vec![],
+                        record: new_mems,
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                    WorkflowEpisode {
+                        task: s.query.clone(),
+                        relevant: s.relevant.clone(),
+                        stale: s.stale.clone(),
+                        cite: s.relevant.clone(),
+                        forbidden: vec![],
+                        record: vec![],
+                        pack: vec![],
+                        top_k: default_top_k(),
+                    },
+                ];
+                let desc: &'static str = match depth {
+                    3 => {
+                        "generated: entrenched incumbent (old cited 3x before the update; new must outrank old)"
+                    }
+                    5 => {
+                        "generated: entrenched incumbent (old cited 5x before the update; new must outrank old)"
+                    }
+                    _ => {
+                        "generated: entrenched incumbent (old cited 8x before the update; new must outrank old)"
+                    }
+                };
+                (desc, Tier::Complex, vec![], eps)
+            }
+        };
+
+        // Background haystack: `spec.background` additional pool memories the
+        // scenario never references, deterministic stride from `i`. They give
+        // the broker a realistic corpus to be confused by.
+        if spec.background > 0 && !fixture.memories.is_empty() {
+            let nm = fixture.memories.len();
+            let start = (i * 37) % nm;
+            let mut added = 0usize;
+            for t in 0..nm {
+                if added >= spec.background {
+                    break;
+                }
+                let m = &fixture.memories[(start + t) % nm];
+                if taken.contains(&m.key) || ban.contains(&m.key) {
+                    continue;
+                }
+                taken.insert(m.key.clone());
+                seed.push(Memory {
+                    key: m.key.clone(),
+                    text: m.text.clone(),
+                    scope: default_scope(),
+                    kind: default_kind(),
+                });
+                added += 1;
+            }
+        }
+
+        out.push(Scenario {
+            id: format!("{prefix}-{i:04}"),
+            dimension: Dimension::Workflow,
+            tier,
+            description: desc.to_string(),
+            memories: vec![],
+            queries: vec![],
+            dedup: None,
+            forgetting: None,
+            cite: vec![],
+            regret: vec![],
+            calibration: None,
+            ages: std::collections::HashMap::new(),
+            transcript: vec![],
+            poisoning: None,
+            render_contract: None,
+            write_gold: vec![],
+            workflow: Some(WorkflowSpec { seed, episodes }),
         });
     }
     Ok(out)
@@ -1148,6 +2045,144 @@ fn run_retrieval(
         } else {
             "ies"
         }
+    );
+    Ok(skeleton_result(scenario, score, detail))
+}
+
+/// Workflow stream: one persistent brain, ordered episodes; per episode the
+/// loop is query → score → cite → record, so later episodes retrieve (or are
+/// distracted by) what earlier ones left behind.
+///
+/// Scenario score = mean over episode scores (see [`score_workflow_episode`]).
+/// Detail additionally reports useful-hit, MRR, false-injection rate,
+/// resolution, and the first-half→second-half learning curve.
+fn run_workflow(
+    scenario: &Scenario,
+    workspace: &Path,
+    kimetsu_bin: &str,
+    budget: usize,
+) -> Result<ScenarioResult, BrainBenchError> {
+    let Some(spec) = &scenario.workflow else {
+        return Ok(skeleton_result(
+            scenario,
+            0.0,
+            "no workflow spec in scenario".to_string(),
+        ));
+    };
+    if spec.episodes.is_empty() {
+        return Ok(skeleton_result(
+            scenario,
+            0.0,
+            "workflow spec has no episodes".to_string(),
+        ));
+    }
+
+    // `known` is every fixture memory ingested so far — the key-matching set
+    // for retrieve_ranked_keys grows as episodes record lessons.
+    let mut known: Vec<Memory> = spec.seed.clone();
+    if !known.is_empty() {
+        ingest(workspace, kimetsu_bin, &known)?;
+    }
+
+    let mut episode_scores: Vec<f64> = Vec::new();
+    let mut gold_scores: Vec<f64> = Vec::new();
+    let mut recalls: Vec<f64> = Vec::new();
+    let mut mrrs: Vec<f64> = Vec::new();
+    let mut resolutions: Vec<f64> = Vec::new();
+    let mut abstentions = 0usize;
+    let mut false_injections = 0usize;
+    let mut forbidden_eps = 0usize;
+    let mut trap_hits = 0usize;
+
+    for (ep_idx, ep) in spec.episodes.iter().enumerate() {
+        let ranked = retrieve_ranked_keys(workspace, kimetsu_bin, &ep.task, budget, &known)?;
+        let es = score_workflow_episode(&ranked, &ep.relevant, &ep.stale, &ep.forbidden, ep.top_k);
+        episode_scores.push(es.score);
+
+        if !ep.forbidden.is_empty() {
+            forbidden_eps += 1;
+            if es.trap_hit {
+                trap_hits += 1;
+            }
+        }
+        if ep.relevant.is_empty() {
+            abstentions += 1;
+            if es.false_injection {
+                false_injections += 1;
+            }
+        } else {
+            gold_scores.push(es.score);
+            recalls.push(recall_at_k(&ranked, &ep.relevant, ep.top_k));
+            mrrs.push(mrr(&ranked, &ep.relevant));
+            if !ep.stale.is_empty() {
+                resolutions.push(if resolution_correct(&ranked, &ep.relevant, &ep.stale) {
+                    1.0
+                } else {
+                    0.0
+                });
+            }
+        }
+
+        // Feedback half of the loop: cite what "helped" (repeats deepen the
+        // promotion), record new lessons, import pack-provenance memories.
+        if !ep.cite.is_empty() {
+            let (id_by_key, _) = list_memory_rows(workspace, kimetsu_bin, &known)?;
+            for key in &ep.cite {
+                match id_by_key.get(key) {
+                    Some(id) => apply_outcome(workspace, kimetsu_bin, "cite", id)?,
+                    None => eprintln!(
+                        "    [brainbench] warn: workflow cite key `{key}` not found in brain"
+                    ),
+                }
+            }
+        }
+        if !ep.record.is_empty() {
+            ingest(workspace, kimetsu_bin, &ep.record)?;
+            known.extend(ep.record.iter().cloned());
+        }
+        if !ep.pack.is_empty() {
+            import_pack(
+                workspace,
+                kimetsu_bin,
+                &ep.pack,
+                false,
+                &format!("{}-ep{ep_idx}", scenario.id),
+            )?;
+            known.extend(ep.pack.iter().cloned());
+        }
+    }
+
+    let score = mean(&episode_scores);
+    let (curve_a, curve_b) = learning_curve(&gold_scores);
+    let false_inj_rate = if abstentions == 0 {
+        0.0
+    } else {
+        false_injections as f64 / abstentions as f64
+    };
+    let resolution_str = if resolutions.is_empty() {
+        "n/a".to_string()
+    } else {
+        format!("{:.2}", mean(&resolutions))
+    };
+    let trap_str = if forbidden_eps == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{:.2}", trap_hits as f64 / forbidden_eps as f64)
+    };
+    let detail = format!(
+        "useful-hit={:.2} mrr={:.2} false-inj={:.2} trap-hit={} resolution={} \
+         curve={:.2}→{:.2} ({} episodes: {} gold, {} abstention; brain={} mems)",
+        mean(&recalls),
+        mean(&mrrs),
+        false_inj_rate,
+        trap_str,
+        resolution_str,
+        curve_a,
+        curve_b,
+        spec.episodes.len(),
+        gold_scores.len(),
+        abstentions,
+        known.len()
     );
     Ok(skeleton_result(scenario, score, detail))
 }
@@ -1893,6 +2928,318 @@ fn forget_f1(proposed: &[String], gold: &[String]) -> f64 {
     }
 }
 
+/// v2.6 poisoning track. Reader-free: each assertion has one right answer.
+///
+/// Exercises the three shipped defences in one scenario — 4a trust-weighted
+/// ranking, 4b import quarantine, and `brain audit` burst detection — and
+/// scores the fraction satisfied. A scenario may use any subset; assertions
+/// that are not configured are simply not counted, so an empty spec scores
+/// 1.0 rather than punishing a partially-specified fixture.
+fn run_poisoning(
+    scenario: &Scenario,
+    workspace: &Path,
+    kimetsu_bin: &str,
+    budget: usize,
+) -> Result<ScenarioResult, BrainBenchError> {
+    let Some(spec) = scenario.poisoning.as_ref() else {
+        return Ok(skeleton_result(
+            scenario,
+            0.0,
+            "no `poisoning` spec in scenario".to_string(),
+        ));
+    };
+
+    // Local corpus first: these are the memories that can earn corroboration.
+    ingest(workspace, kimetsu_bin, &scenario.memories)?;
+
+    // Corroboration first: a citation from a successful local run is what
+    // erases the origin discount, so it must land before ranking is inspected.
+    if !scenario.cite.is_empty() {
+        let (id_by_key, _) = list_memory_rows(workspace, kimetsu_bin, &scenario.memories)?;
+        for key in &scenario.cite {
+            if let Some(id) = id_by_key.get(key) {
+                apply_outcome(workspace, kimetsu_bin, "cite", id)?;
+            }
+        }
+    }
+
+    // The pack must arrive as a real IMPORT, not as more local writes. Seeding
+    // it with `memory add` would give it local provenance, so the 4a trust
+    // discount would have nothing to bite on and the 4b quarantine path would
+    // never run — the scenario would pass or fail for reasons unrelated to the
+    // mechanism it claims to test. So: build the pack in a throwaway brain,
+    // export it, and import it here.
+    if !spec.pack.is_empty() {
+        import_pack(
+            workspace,
+            kimetsu_bin,
+            &spec.pack,
+            spec.quarantine,
+            &scenario.id,
+        )?;
+    }
+
+    let mut passed = 0usize;
+    let mut total = 0usize;
+    let mut notes: Vec<String> = Vec::new();
+
+    let ranked = if spec.query.trim().is_empty() {
+        Vec::new()
+    } else {
+        let all: Vec<Memory> = scenario
+            .memories
+            .iter()
+            .chain(spec.pack.iter())
+            .cloned()
+            .collect();
+        retrieve_ranked_keys(workspace, kimetsu_bin, &spec.query, budget, &all)?
+    };
+
+    // (1) Quarantined / poisoned content must never reach the bundle.
+    for key in &spec.must_not_retrieve {
+        total += 1;
+        if ranked.iter().any(|k| k == key) {
+            notes.push(format!("{key} reached retrieval but must not"));
+        } else {
+            passed += 1;
+        }
+    }
+
+    // (2) A corroborated local memory must outrank every pack entry. Origin is
+    // a weight, never a gate — so this checks ORDER, not exclusion.
+    if !spec.must_outrank.is_empty() {
+        let pack_keys: Vec<&str> = spec.pack.iter().map(|m| m.key.as_str()).collect();
+        let worst_pack = pack_keys
+            .iter()
+            .filter_map(|k| ranked.iter().position(|r| r == k))
+            .min();
+        for key in &spec.must_outrank {
+            total += 1;
+            match (ranked.iter().position(|r| r == key), worst_pack) {
+                (Some(local_at), Some(pack_at)) if local_at < pack_at => passed += 1,
+                (Some(local_at), Some(pack_at)) => notes.push(format!(
+                    "{key} at {local_at} ranked below pack at {pack_at}"
+                )),
+                (Some(_), None) => passed += 1, // no pack entry surfaced at all
+                (None, _) => notes.push(format!("{key} did not surface")),
+            }
+        }
+    }
+
+    // (3) `brain audit` must see the burst the pack import left behind.
+    if spec.expect_bursts > 0 {
+        total += 1;
+        match audit_burst_count(workspace, kimetsu_bin) {
+            Ok(n) if n >= spec.expect_bursts => passed += 1,
+            Ok(n) => notes.push(format!(
+                "audit flagged {n} burst(s), expected >= {}",
+                spec.expect_bursts
+            )),
+            Err(e) => notes.push(format!("audit failed: {e}")),
+        }
+    }
+
+    let score = if total == 0 {
+        1.0
+    } else {
+        passed as f64 / total as f64
+    };
+    let detail = if notes.is_empty() {
+        format!("{passed}/{total} poisoning assertions held")
+    } else {
+        format!("{passed}/{total} held; {}", notes.join("; "))
+    };
+    Ok(skeleton_result(scenario, score, detail))
+}
+
+/// Build a pack from `memories` in a scratch brain, then import it into
+/// `workspace` so the rows carry pack provenance.
+///
+/// `quarantine` mirrors what an `http(s)://` source gets by default: the rows
+/// land in the review queue and must not reach retrieval until accepted.
+fn import_pack(
+    workspace: &Path,
+    kimetsu_bin: &str,
+    memories: &[Memory],
+    quarantine: bool,
+    scenario_id: &str,
+) -> Result<(), BrainBenchError> {
+    let scratch = std::env::temp_dir().join(format!("kbench-pack-{scenario_id}"));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch)
+        .map_err(|e| BrainBenchError::KimetsuError(format!("pack scratch dir: {e}")))?;
+    // A git dir is what project discovery stops at — without it the scratch
+    // brain escapes into $HOME and seeds the developer's real corpus.
+    let _ = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&scratch)
+        .output();
+    let init = Command::new(kimetsu_bin)
+        .current_dir(&scratch)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .arg("init")
+        .output()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("pack brain init: {e}")))?;
+    if !init.status.success() {
+        return Err(BrainBenchError::KimetsuError(format!(
+            "pack brain init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        )));
+    }
+    ingest(&scratch, kimetsu_bin, memories)?;
+
+    let pack_file = scratch.join("pack.json");
+    let export = Command::new(kimetsu_bin)
+        .current_dir(&scratch)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .args(["brain", "export"])
+        .arg(&pack_file)
+        .output()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("pack export: {e}")))?;
+    if !export.status.success() {
+        return Err(BrainBenchError::KimetsuError(format!(
+            "pack export failed: {}",
+            String::from_utf8_lossy(&export.stderr)
+        )));
+    }
+
+    let mut cmd = Command::new(kimetsu_bin);
+    cmd.current_dir(workspace)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .args(["brain", "import"])
+        .arg(&pack_file);
+    // Explicit either way: the default flips on source type, and a scenario
+    // should not depend on which side of that flip a local file lands.
+    cmd.arg(if quarantine {
+        "--quarantine"
+    } else {
+        "--no-quarantine"
+    });
+    let imported = cmd
+        .output()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("pack import: {e}")))?;
+    if !imported.status.success() {
+        return Err(BrainBenchError::KimetsuError(format!(
+            "pack import failed: {}",
+            String::from_utf8_lossy(&imported.stderr)
+        )));
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    Ok(())
+}
+
+/// Count write bursts reported by `brain audit --json`.
+fn audit_burst_count(workspace: &Path, kimetsu_bin: &str) -> Result<usize, BrainBenchError> {
+    let out = Command::new(kimetsu_bin)
+        .current_dir(workspace)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .args(["brain", "audit", "--json"])
+        .output()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("spawn `brain audit`: {e}")))?;
+    let body = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|e| BrainBenchError::KimetsuError(format!("audit json: {e}")))?;
+    Ok(v.get("bursts")
+        .and_then(|b| b.as_array())
+        .map_or(0, |a| a.len()))
+}
+
+/// v2.6 render-contract track — what the injected text says, not how a reader
+/// reacts to it. See [`Dimension::RenderContract`] for why this is deliberately
+/// not called a sycophancy measurement.
+fn run_render_contract(
+    scenario: &Scenario,
+    workspace: &Path,
+    kimetsu_bin: &str,
+) -> Result<ScenarioResult, BrainBenchError> {
+    let Some(spec) = scenario.render_contract.as_ref() else {
+        return Ok(skeleton_result(
+            scenario,
+            0.0,
+            "no `render_contract` spec in scenario".to_string(),
+        ));
+    };
+    ingest(workspace, kimetsu_bin, &scenario.memories)?;
+
+    // The contract lives in the HOOK's output, not `brain context`. The latter
+    // prints a scored diagnostic (stage/tokens/capsule lines) with no framing
+    // at all — asserting against it would silently pass every scenario that
+    // depends on the header. `context-hook` is what an agent actually receives.
+    let payload = serde_json::json!({
+        "session_id": format!("render-contract-{}", scenario.id),
+        "prompt": spec.query,
+    })
+    .to_string();
+
+    let mut child = Command::new(kimetsu_bin)
+        .current_dir(workspace)
+        .env("KIMETSU_USER_BRAIN", "0")
+        .args(["brain", "context-hook"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("spawn `brain context-hook`: {e}")))?;
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            BrainBenchError::KimetsuError("context-hook stdin unavailable".to_string())
+        })?;
+        stdin
+            .write_all(payload.as_bytes())
+            .map_err(|e| BrainBenchError::KimetsuError(format!("write hook payload: {e}")))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| BrainBenchError::KimetsuError(format!("context-hook: {e}")))?;
+
+    // Pull `additionalContext` out rather than matching the raw JSON, so
+    // assertions compare against the text the agent sees and are not defeated
+    // by JSON escaping.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let rendered = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .and_then(|v| {
+            v.get("hookSpecificOutput")?
+                .get("additionalContext")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+
+    let mut passed = 0usize;
+    let mut total = 0usize;
+    let mut notes: Vec<String> = Vec::new();
+    for needle in &spec.must_contain {
+        total += 1;
+        if rendered.contains(needle.as_str()) {
+            passed += 1;
+        } else {
+            notes.push(format!("missing {needle:?}"));
+        }
+    }
+    for needle in &spec.must_not_contain {
+        total += 1;
+        if rendered.contains(needle.as_str()) {
+            notes.push(format!("present but forbidden: {needle:?}"));
+        } else {
+            passed += 1;
+        }
+    }
+
+    let score = if total == 0 {
+        1.0
+    } else {
+        passed as f64 / total as f64
+    };
+    let detail = if notes.is_empty() {
+        format!("{passed}/{total} contract clauses held")
+    } else {
+        format!("{passed}/{total} held; {}", notes.join("; "))
+    };
+    Ok(skeleton_result(scenario, score, detail))
+}
+
 fn skeleton_result(scenario: &Scenario, score: f64, detail: String) -> ScenarioResult {
     ScenarioResult {
         id: scenario.id.clone(),
@@ -2059,6 +3406,8 @@ pub fn run_single_scenario(
             run_forgetting(scenario, workspace, kimetsu_bin, cfg.budget_tokens)
         }
         Dimension::Calibration => run_calibration(scenario, workspace, kimetsu_bin),
+        Dimension::Poisoning => run_poisoning(scenario, workspace, kimetsu_bin, cfg.budget_tokens),
+        Dimension::RenderContract => run_render_contract(scenario, workspace, kimetsu_bin),
         Dimension::WritePrecision => run_write_precision(
             scenario,
             workspace,
@@ -2067,6 +3416,7 @@ pub fn run_single_scenario(
             &cfg.distill_model,
         ),
         Dimension::Graph => run_graph(scenario, workspace, kimetsu_bin, cfg.budget_tokens),
+        Dimension::Workflow => run_workflow(scenario, workspace, kimetsu_bin, cfg.budget_tokens),
     };
 
     match result {
@@ -2111,6 +3461,17 @@ pub fn run_brainbench(cfg: &BrainBenchConfig) -> Result<BrainBenchReport, BrainB
         all_scenarios.extend(synthesized);
     }
 
+    // Synthesize workflow-stream scenarios from pools.
+    for wf_gen in &dataset.workflow_gen {
+        let synthesized = expand_workflow_gen(wf_gen, &base_dir)?;
+        eprintln!(
+            "brainbench: synthesized {} workflow scenario(s) from pool {}",
+            synthesized.len(),
+            wf_gen.source
+        );
+        all_scenarios.extend(synthesized);
+    }
+
     let scenarios = filter_scenarios(all_scenarios, cfg);
 
     eprintln!("brainbench: {} scenario(s) to run", scenarios.len());
@@ -2121,24 +3482,88 @@ pub fn run_brainbench(cfg: &BrainBenchConfig) -> Result<BrainBenchReport, BrainB
     super::longmemeval::require_embeddings_build(&kimetsu_bin)
         .map_err(|e| BrainBenchError::Other(e.to_string()))?;
 
-    let mut results: Vec<ScenarioResult> = Vec::new();
-    for (i, scenario) in scenarios.iter().enumerate() {
+    // fastembed resolves its model cache to `.fastembed_cache` under the CWD
+    // unless FASTEMBED_CACHE_DIR is set, so every fresh scenario workspace
+    // would re-download ~600 MB of ONNX models (~2 min per scenario, and zero
+    // parallel speedup because the bottleneck is the network). Point every
+    // spawned kimetsu at one shared cache. Safe: we are single-threaded here,
+    // before any worker spawns.
+    if std::env::var_os("FASTEMBED_CACHE_DIR").is_none() {
+        let cache = std::env::temp_dir().join("kimetsu-fastembed-cache");
+        unsafe { std::env::set_var("FASTEMBED_CACHE_DIR", &cache) };
         eprintln!(
-            "  [{}/{}] {} | dim={} tier={} ...",
-            i + 1,
-            scenarios.len(),
-            scenario.id,
-            scenario.dimension.as_str(),
-            scenario.tier.as_str()
+            "brainbench: FASTEMBED_CACHE_DIR not set; using shared cache {}",
+            cache.display()
         );
-        let r = run_single_scenario(scenario, cfg, &kimetsu_bin);
-        if r.skipped {
-            eprintln!("    -> skipped (Phase 2)");
-        } else {
-            eprintln!("    -> score={:.2} | {}", r.score, r.detail);
-        }
-        results.push(r);
     }
+
+    let jobs = cfg.jobs.max(1).min(scenarios.len().max(1));
+    let results: Vec<ScenarioResult> = if jobs <= 1 {
+        let mut results: Vec<ScenarioResult> = Vec::new();
+        for (i, scenario) in scenarios.iter().enumerate() {
+            eprintln!(
+                "  [{}/{}] {} | dim={} tier={} ...",
+                i + 1,
+                scenarios.len(),
+                scenario.id,
+                scenario.dimension.as_str(),
+                scenario.tier.as_str()
+            );
+            let r = run_single_scenario(scenario, cfg, &kimetsu_bin);
+            if r.skipped {
+                eprintln!("    -> skipped (Phase 2)");
+            } else {
+                eprintln!("    -> score={:.2} | {}", r.score, r.detail);
+            }
+            results.push(r);
+        }
+        results
+    } else {
+        // Parallel execution: each scenario runs in its own isolated temp
+        // workspace, so a shared atomic work index is all the coordination
+        // needed. Results are re-sorted to dataset order afterwards.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        eprintln!("brainbench: running with {jobs} parallel workers");
+        let next = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        let total = scenarios.len();
+        let scenarios_ref = &scenarios;
+        let kimetsu_ref = kimetsu_bin.as_str();
+        let mut indexed: Vec<(usize, ScenarioResult)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..jobs)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut local: Vec<(usize, ScenarioResult)> = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= total {
+                                break;
+                            }
+                            let scenario = &scenarios_ref[i];
+                            let r = run_single_scenario(scenario, cfg, kimetsu_ref);
+                            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                            eprintln!(
+                                "  [{d}/{total}] {} | dim={} tier={} -> score={:.2} | {}",
+                                r.id,
+                                r.dimension.as_str(),
+                                r.tier.as_str(),
+                                r.score,
+                                r.detail
+                            );
+                            local.push((i, r));
+                        }
+                        local
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("brainbench worker panicked"))
+                .collect()
+        });
+        indexed.sort_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, r)| r).collect()
+    };
 
     Ok(build_report(results, &cfg.dataset_path))
 }
@@ -2211,6 +3636,7 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
     BrainBenchDataset {
         eval_fixtures: vec![],
         calibration_gen: None,
+        workflow_gen: vec![],
         scenarios: vec![
             Scenario {
                 id: "syn-retrieval-easy".to_string(),
@@ -2251,7 +3677,10 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 calibration: None,
                 ages: std::collections::HashMap::new(),
                 transcript: vec![],
+                poisoning: None,
+                render_contract: None,
                 write_gold: vec![],
+                workflow: None,
             },
             Scenario {
                 id: "syn-retrieval-update".to_string(),
@@ -2286,7 +3715,10 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 calibration: None,
                 ages: std::collections::HashMap::new(),
                 transcript: vec![],
+                poisoning: None,
+                render_contract: None,
                 write_gold: vec![],
+                workflow: None,
             },
             Scenario {
                 id: "syn-importance-medium".to_string(),
@@ -2327,7 +3759,10 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 calibration: None,
                 ages: std::collections::HashMap::new(),
                 transcript: vec![],
+                poisoning: None,
+                render_contract: None,
                 write_gold: vec![],
+                workflow: None,
             },
             Scenario {
                 id: "syn-dedup-easy".to_string(),
@@ -2368,7 +3803,10 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 calibration: None,
                 ages: std::collections::HashMap::new(),
                 transcript: vec![],
+                poisoning: None,
+                render_contract: None,
                 write_gold: vec![],
+                workflow: None,
             },
         ],
     }
@@ -2382,6 +3820,102 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn workflow_gold_episode_scores_recall() {
+        let es = score_workflow_episode(&s(&["a", "b"]), &s(&["a"]), &[], &[], 4);
+        assert_eq!(es.score, 1.0);
+        assert!(!es.false_injection);
+        let es = score_workflow_episode(&s(&["b"]), &s(&["a"]), &[], &[], 4);
+        assert_eq!(es.score, 0.0);
+        assert!(!es.false_injection);
+    }
+
+    #[test]
+    fn workflow_stale_gates_gold_score() {
+        // Stale outranks relevant -> gated to 0 despite recall hit.
+        let es = score_workflow_episode(&s(&["old", "new"]), &s(&["new"]), &s(&["old"]), &[], 4);
+        assert_eq!(es.score, 0.0);
+        // Relevant outranks stale -> full recall credit.
+        let es = score_workflow_episode(&s(&["new", "old"]), &s(&["new"]), &s(&["old"]), &[], 4);
+        assert_eq!(es.score, 1.0);
+    }
+
+    #[test]
+    fn workflow_abstention_episode() {
+        // Nothing surfaced when nothing is relevant -> perfect silence.
+        let es = score_workflow_episode(&[], &[], &[], &[], 4);
+        assert_eq!(es.score, 1.0);
+        assert!(!es.false_injection);
+        // Any fixture memory in top_k on an empty-gold episode -> false injection.
+        let es = score_workflow_episode(&s(&["distractor"]), &[], &[], &[], 4);
+        assert_eq!(es.score, 0.0);
+        assert!(es.false_injection);
+        // Surfaced but beyond top_k -> still silent within the cut-off.
+        let es = score_workflow_episode(&s(&["x", "y"]), &[], &[], &[], 0);
+        assert_eq!(es.score, 1.0);
+        assert!(!es.false_injection);
+    }
+
+    #[test]
+    fn workflow_trap_gate() {
+        // Trap outranks the truth -> precision failure, score 0.
+        let es =
+            score_workflow_episode(&s(&["trap", "gold"]), &s(&["gold"]), &[], &s(&["trap"]), 4);
+        assert_eq!(es.score, 0.0);
+        assert!(es.trap_hit);
+        // Truth outranks the trap -> full credit, no trap hit recorded.
+        let es =
+            score_workflow_episode(&s(&["gold", "trap"]), &s(&["gold"]), &[], &s(&["trap"]), 4);
+        assert_eq!(es.score, 1.0);
+        assert!(!es.trap_hit);
+        // Trap surfaces while the truth is absent entirely -> trap hit.
+        let es = score_workflow_episode(&s(&["trap"]), &s(&["gold"]), &[], &s(&["trap"]), 4);
+        assert_eq!(es.score, 0.0);
+        assert!(es.trap_hit);
+        // Trap surfacing on an abstention episode -> false injection AND trap hit.
+        let es = score_workflow_episode(&s(&["trap"]), &[], &[], &s(&["trap"]), 4);
+        assert_eq!(es.score, 0.0);
+        assert!(es.false_injection);
+        assert!(es.trap_hit);
+    }
+
+    #[test]
+    fn workflow_learning_curve_halves() {
+        let (a, b) = learning_curve(&[0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(a, 0.0);
+        assert_eq!(b, 1.0);
+        // Odd length: middle episode falls in the second half.
+        let (a, b) = learning_curve(&[0.0, 1.0, 1.0]);
+        assert_eq!(a, 0.0);
+        assert_eq!(b, 1.0);
+        // Degenerate: single gold episode mirrors into both halves.
+        let (a, b) = learning_curve(&[0.5]);
+        assert_eq!(a, 0.5);
+        assert_eq!(b, 0.5);
+    }
+
+    #[test]
+    fn workflow_spec_parses_from_json() {
+        let json = r#"{
+            "id": "wf-1", "dimension": "workflow", "tier": "medium",
+            "workflow": {
+                "seed": [{"key": "d1", "text": "distractor"}],
+                "episodes": [
+                    {"task": "first task"},
+                    {"task": "second task", "relevant": ["l1"], "cite": ["l1"],
+                     "record": [{"key": "l2", "text": "another lesson"}]}
+                ]
+            }
+        }"#;
+        let sc: Scenario = serde_json::from_str(json).expect("workflow scenario parses");
+        assert_eq!(sc.dimension, Dimension::Workflow);
+        let wf = sc.workflow.expect("workflow spec present");
+        assert_eq!(wf.seed.len(), 1);
+        assert_eq!(wf.episodes.len(), 2);
+        assert!(wf.episodes[0].relevant.is_empty());
+        assert_eq!(wf.episodes[1].top_k, 4);
     }
 
     // ── Metric: recall_at_k ───────────────────────────────────────────────────
@@ -2701,6 +4235,177 @@ mod tests {
             limit: 0,
             distill_provider: "ollama".to_string(),
             distill_model: "qwen2.5:3b".to_string(),
+            jobs: 1,
+        }
+    }
+
+    fn workflow_pool_file(dir: &Path) -> PathBuf {
+        // 6 memories; cases include a paraphrase pair (both hit `m1`) and one
+        // knowledge-update case (m5 supersedes m6).
+        let pool = serde_json::json!({
+            "memories": [
+                {"key": "m1", "text": "lesson one about the linker on windows"},
+                {"key": "m2", "text": "lesson two about docker bind mounts on windows hosts"},
+                {"key": "m3", "text": "lesson three about ci caching for docker builds"},
+                {"key": "m4", "text": "lesson four about sqlite pragmas"},
+                {"key": "m5", "text": "new deploy lesson: use make deploy-preview"},
+                {"key": "m6", "text": "old deploy lesson: use make deploy-staging"}
+            ],
+            "cases": [
+                {"query": "linker error on windows", "relevant": ["m1"]},
+                {"query": "build fails at the link step", "relevant": ["m1"]},
+                {"query": "docker bind mounts are empty", "relevant": ["m2"]},
+                {"query": "ci cache misses every run", "relevant": ["m3"]},
+                {"query": "sqlite is slow on many writes", "relevant": ["m4"]},
+                {"query": "how do we deploy for review", "relevant": ["m5"], "stale": ["m6"]}
+            ]
+        });
+        let path = dir.join("wf-pool.json");
+        std::fs::write(&path, serde_json::to_string(&pool).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn expand_workflow_gen_is_deterministic_and_well_formed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _pool = workflow_pool_file(tmp.path());
+        let spec = WorkflowGenSpec {
+            source: "wf-pool.json".to_string(),
+            count: 12,
+            id_prefix: String::new(),
+            background: 0,
+        };
+        let a = expand_workflow_gen(&spec, tmp.path()).unwrap();
+        let b = expand_workflow_gen(&spec, tmp.path()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+            "generation must be deterministic"
+        );
+        assert_eq!(a.len(), 12);
+
+        let mut ids = std::collections::HashSet::new();
+        let mut saw_update = false;
+        let mut saw_same_query_before_after = false;
+        let mut saw_trap = false;
+        let mut saw_pack = false;
+        let mut saw_entrenched = false;
+        for sc in &a {
+            assert!(ids.insert(sc.id.clone()), "duplicate id {}", sc.id);
+            assert_eq!(sc.dimension, Dimension::Workflow);
+            let wf = sc.workflow.as_ref().expect("workflow spec");
+            assert!(!wf.episodes.is_empty());
+
+            // Every retrieval-facing key (relevant/stale/cite/forbidden) must
+            // be available — seeded, or recorded/pack-imported by an earlier
+            // episode.
+            let mut available: std::collections::HashSet<&str> =
+                wf.seed.iter().map(|m| m.key.as_str()).collect();
+            for ep in &wf.episodes {
+                for k in ep
+                    .relevant
+                    .iter()
+                    .chain(&ep.stale)
+                    .chain(&ep.cite)
+                    .chain(&ep.forbidden)
+                {
+                    assert!(
+                        available.contains(k.as_str()),
+                        "{}: episode `{}` references key `{k}` before it exists",
+                        sc.id,
+                        ep.task
+                    );
+                }
+                for m in ep.record.iter().chain(&ep.pack) {
+                    available.insert(m.key.as_str());
+                }
+                if !ep.stale.is_empty() {
+                    saw_update = true;
+                }
+                if !ep.forbidden.is_empty() {
+                    saw_trap = true;
+                }
+                if !ep.pack.is_empty() {
+                    saw_pack = true;
+                }
+                // Entrenched incumbent: a cite list with repeated keys.
+                let distinct: std::collections::HashSet<&str> =
+                    ep.cite.iter().map(|k| k.as_str()).collect();
+                if ep.cite.len() > distinct.len() {
+                    saw_entrenched = true;
+                }
+            }
+            // Before/after pair: an abstention episode and a later gold episode
+            // sharing the same task string.
+            for (x, ex) in wf.episodes.iter().enumerate() {
+                if ex.relevant.is_empty() {
+                    if wf.episodes[x + 1..]
+                        .iter()
+                        .any(|ey| ey.task == ex.task && !ey.relevant.is_empty())
+                    {
+                        saw_same_query_before_after = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_update,
+            "pool has a stale case, so update streams expected"
+        );
+        assert!(
+            saw_same_query_before_after,
+            "record→re-query streams expected"
+        );
+        assert!(saw_trap, "semantic-trap streams expected (forbidden keys)");
+        assert!(saw_pack, "poisoned-pack streams expected");
+        assert!(
+            saw_entrenched,
+            "entrenched-incumbent streams expected (repeated cite keys)"
+        );
+    }
+
+    #[test]
+    fn expand_workflow_gen_background_grows_the_haystack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _pool = workflow_pool_file(tmp.path());
+        let base = WorkflowGenSpec {
+            source: "wf-pool.json".to_string(),
+            count: 6,
+            id_prefix: String::new(),
+            background: 0,
+        };
+        let with_bg = WorkflowGenSpec {
+            background: 2,
+            ..base.clone()
+        };
+        let plain = expand_workflow_gen(&base, tmp.path()).unwrap();
+        let padded = expand_workflow_gen(&with_bg, tmp.path()).unwrap();
+        assert_eq!(plain.len(), padded.len());
+        for (p, q) in plain.iter().zip(&padded) {
+            let (pw, qw) = (p.workflow.as_ref().unwrap(), q.workflow.as_ref().unwrap());
+            assert!(
+                qw.seed.len() > pw.seed.len(),
+                "{}: background must add seed memories ({} vs {})",
+                q.id,
+                qw.seed.len(),
+                pw.seed.len()
+            );
+            // Background memories must never be gold, stale, or forbidden for
+            // any episode, and episode structure must be unchanged.
+            assert_eq!(pw.episodes.len(), qw.episodes.len());
+            let extra: Vec<&str> = qw.seed[pw.seed.len()..]
+                .iter()
+                .map(|m| m.key.as_str())
+                .collect();
+            for ep in &qw.episodes {
+                for k in ep.relevant.iter().chain(&ep.stale).chain(&ep.forbidden) {
+                    assert!(
+                        !extra.contains(&k.as_str()),
+                        "{}: background key `{k}` collides with an episode assertion",
+                        q.id
+                    );
+                }
+            }
         }
     }
 

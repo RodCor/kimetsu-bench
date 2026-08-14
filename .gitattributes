@@ -1,0 +1,11 @@
+# Anything that is executed inside a Linux container must check out LF, even on
+# a Windows clone with core.autocrlf=true. A CR at end-of-line survives into the
+# shell and the failure is ugly to diagnose: `$'\r': command not found`, or a
+# script that reports "cannot execute: required file not found" because its
+# shebang reads `#!/bin/bash\r`. That cost a full 25-minute trial once, and the
+# run still printed a plausible-looking 0.00 rather than an error.
+#
+# harness/*.py embeds shell snippets in Python string literals, so it is exposed
+# to exactly this even though Python itself tolerates CRLF.
+*.sh   text eol=lf
+*.py   text eol=lf

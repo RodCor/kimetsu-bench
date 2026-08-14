@@ -1,5 +1,27 @@
 //! Terminal-Bench driver — Layer 2 v1.
 //!
+//! ## Running non-registry suites (e.g. DeepSWE) — read before quoting a number
+//!
+//! `tb_task_path` points Harbor at a local task directory (`--path`) instead
+//! of a registry dataset, which makes suites like DeepSWE runnable without a
+//! conversion step: they ship the same `task.toml` schema family Harbor
+//! already parses, with prebuilt images.
+//!
+//! **A score produced this way is NOT a DeepSWE score and must never be
+//! reported as one.** Two independent deviations from that benchmark's
+//! protocol:
+//!
+//! 1. **Wrong agent.** DeepSWE mandates `mini-swe-agent` for every model
+//!    precisely so that results compare agent+model pairs on equal footing.
+//!    This driver runs Harbor's `claude-code` / `codex` host agents.
+//! 2. **Modified harness.** The `+km` configurations inject a memory sidecar
+//!    over MCP, which the mandated harness does not have.
+//!
+//! Either one alone invalidates comparison against the published leaderboard.
+//! What this setup *is* good for is the internal A/B it was built for —
+//! `claude+km` against `claude` on identical tasks, where both arms carry the
+//! same deviations and therefore cancel.
+//!
 //! Wraps the Harbor CLI to drive Terminal-Bench tasks under different
 //! agent configurations. Uses Harbor's built-in `claude-code` / `codex`
 //! host agents; for `+km` configs, attaches kimetsu's MCP server via
@@ -239,6 +261,19 @@ impl TerminalBenchDriver {
             .get("tb_dataset")
             .cloned()
             .unwrap_or_else(|| DEFAULT_DATASET.to_string())
+    }
+
+    /// Resolve a local task/dataset **directory**, when the caller wants
+    /// Harbor's `--path` instead of a registry dataset.
+    ///
+    /// This is what makes non-registry suites runnable — DeepSWE ships its
+    /// 117 tasks as plain directories carrying the same `task.toml` schema
+    /// family Harbor already parses (`schema_version = "1.3"`), with a
+    /// prebuilt `docker_image`, so no conversion step is needed. `--path` and
+    /// `--dataset` are mutually exclusive; `--include-task-name` filters
+    /// either one, so task selection is unchanged.
+    fn task_path(&self) -> Option<String> {
+        self.ctx.overrides.get("tb_task_path").cloned()
     }
 
     /// Resolve the sandbox environment flag.
@@ -484,19 +519,44 @@ impl BenchmarkDriver for TerminalBenchDriver {
         // (`adaptive-rejection-sampler`), wrap it as `*/<name>` so
         // Harbor matches it across whatever registry the dataset
         // belongs to. Full names pass through unchanged.
-        let include_pattern = if task.0.contains('/') {
+        // Registry datasets namespace their tasks (`terminal-bench/foo`), so a
+        // bare id is widened to `*/foo`. A local `--path` dataset does NOT:
+        // Harbor keys those on the task *directory* name, so the same widening
+        // matches nothing ("No tasks matched the filter(s) ['*/foo']") even
+        // though the task.toml `[task] name` does carry an org prefix.
+        let local_path = self.task_path();
+        let include_pattern = if task.0.contains('/') || local_path.is_some() {
             task.0.clone()
         } else {
             format!("*/{}", task.0)
         };
+        // Task source: a local directory (`--path`, used for suites that do
+        // not live in Harbor's registry) or a registry dataset. Mutually
+        // exclusive; `--include-task-name` selects within either.
+        cmd.arg("run");
+        match local_path {
+            Some(ref path) => cmd.args(["--path", path.as_str()]),
+            None => cmd.args(["--dataset", &dataset]),
+        };
+        cmd.args(["--include-task-name", &include_pattern]);
+        // Local task suites (DeepSWE) grade in a SEPARATE verifier container,
+        // so the agent's in-place edits are invisible to it. The only channel
+        // is `/logs/artifacts/model.patch`, and Harbor has no lifecycle step
+        // that creates it (upstream relies on a `pre_artifacts.sh` hook their
+        // own runner provides). Swap in a wrapper agent that captures the
+        // patch, or every trial silently grades a pristine checkout. See
+        // harness/kbench_agents.py.
+        match local_path {
+            Some(_) => {
+                let import_path = capture_agent_import_path(&agent_name)?;
+                cmd.args(["--agent-import-path", import_path]);
+                cmd.env("PYTHONPATH", harness_dir());
+            }
+            None => {
+                cmd.args(["--agent", &agent_name]);
+            }
+        }
         cmd.args([
-            "run",
-            "--dataset",
-            &dataset,
-            "--include-task-name",
-            &include_pattern,
-            "--agent",
-            &agent_name,
             "--jobs-dir",
             &output_dir.to_string_lossy(),
             "--env",
@@ -629,6 +689,38 @@ impl BenchmarkDriver for TerminalBenchDriver {
                 )));
             }
         };
+        // Local suites grade in a separate container off `model.patch` alone.
+        // If the capture produced nothing, the verifier scored a pristine
+        // checkout and the reward is meaningless — fail the trial instead of
+        // recording a 0.00 that is indistinguishable from a real attempt.
+        if self.task_path().is_some()
+            && let Some(job_dir) = result_path.parent()
+        {
+            let trial_dir = fs::read_dir(job_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.join("artifacts").is_dir());
+            match trial_dir.as_deref().and_then(model_patch_bytes) {
+                Some(n) if n > 0 => {}
+                other => {
+                    let what = match other {
+                        Some(_) => "model.patch is empty (0 bytes)",
+                        None => "model.patch was never produced",
+                    };
+                    return Err(DriverError::GradingFailed(format!(
+                        "{what} for task `{}` under {}. The separate verifier \
+                         therefore graded a pristine checkout, so its reward is \
+                         not a measurement of this agent. Check the `[capture]` \
+                         lines in the trial log.",
+                        run.task.0,
+                        job_dir.display()
+                    )));
+                }
+            }
+        }
         let bytes = fs::read(&result_path).map_err(|e| {
             DriverError::GradingFailed(format!("could not read {}: {e}", result_path.display()))
         })?;
@@ -650,6 +742,50 @@ impl BenchmarkDriver for TerminalBenchDriver {
 /// inspect the directory). Zero matches → "Harbor ran without
 /// writing a result," a useful surface for the caller's failure
 /// notes.
+/// Directory holding the Python agent wrappers (`harness/kbench_agents.py`).
+///
+/// Anchored to the crate root for the same reason `--task-path` is: the
+/// per-trial worker re-execs with its cwd on `/tmp`, so a relative path
+/// resolves to `/tmp/harness` and the import fails.
+fn harness_dir() -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("harness")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Map a Harbor built-in agent name onto our capturing subclass.
+///
+/// An unrecognised agent is a hard error rather than a quiet fallback to plain
+/// `--agent <name>`. Running a separate-verifier suite without the capture does
+/// not fail loudly — it grades a pristine checkout and reports a uniform,
+/// entirely plausible `0.00` for every task and every arm.
+fn capture_agent_import_path(agent_name: &str) -> Result<&'static str, DriverError> {
+    match agent_name {
+        "claude-code" => Ok("kbench_agents:CaptureClaudeCode"),
+        "codex" => Ok("kbench_agents:CaptureCodex"),
+        "oracle" => Ok("kbench_agents:CaptureOracle"),
+        other => Err(DriverError::Other(format!(
+            "no model.patch capture wrapper for agent `{other}`. Local task \
+             suites (--task-path) grade in a separate verifier container and \
+             need one, or every trial silently scores 0. Add a subclass to \
+             harness/kbench_agents.py and map it here."
+        ))),
+    }
+}
+
+/// Did the capture actually produce a patch for this trial?
+///
+/// A missing or empty `model.patch` means the verifier graded a pristine
+/// checkout, so the resulting 0.00 is an unmeasured trial rather than a failed
+/// attempt. The two are indistinguishable in `result.json`, which is exactly
+/// how a whole 226-trial run once completed without measuring anything.
+fn model_patch_bytes(trial_dir: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(trial_dir.join("artifacts").join("model.patch"))
+        .ok()
+        .map(|m| m.len())
+}
+
 fn find_harbor_result_path(output_dir: &std::path::Path) -> Result<PathBuf, String> {
     let entries = std::fs::read_dir(output_dir)
         .map_err(|e| format!("could not read {}: {e}", output_dir.display()))?;
@@ -907,10 +1043,30 @@ fn parse_harbor_result(
         #[serde(default)]
         exception_stats: std::collections::BTreeMap<String, Vec<String>>,
     }
+    /// Harbor does not use one metric shape for every suite.
+    ///
+    /// Terminal-Bench emits an aggregate: `{"mean": 1.0}`. DeepSWE emits the
+    /// grader's named fields instead: `{"reward": 1.0, "f2p": 1.0, "p2p": 1.0,
+    /// "partial": 1.0, ...}` with no `mean` at all. Reading only `mean` yields
+    /// `None` for every DeepSWE task, which scores 0.0 — so a fully successful
+    /// run reports `✗ 0.00` on all 113 tasks while `reward: 1.0` sits in the
+    /// file. Another wrong answer that reads exactly like a real result.
+    ///
+    /// `reward` is the right fallback rather than `partial`: it is the binary
+    /// pass/fail the suite is scored on, and kbench runs one trial per task per
+    /// agent, so there is nothing for a mean to average over.
     #[derive(Deserialize)]
     struct MetricEntry {
         #[serde(default)]
         mean: Option<f64>,
+        #[serde(default)]
+        reward: Option<f64>,
+    }
+
+    impl MetricEntry {
+        fn score(&self) -> Option<f64> {
+            self.mean.or(self.reward)
+        }
     }
 
     let r: HarborResult = serde_json::from_slice(bytes).map_err(|e| {
@@ -935,7 +1091,7 @@ fn parse_harbor_result(
     // Score = average of all eval means. Missing / empty metrics → 0.
     let mut means: Vec<f64> = Vec::new();
     for entry in stats.evals.values() {
-        if let Some(m) = entry.metrics.first().and_then(|m| m.mean) {
+        if let Some(m) = entry.metrics.first().and_then(MetricEntry::score) {
             means.push(m);
         }
     }
@@ -1212,6 +1368,122 @@ mod tests {
             msg.contains("result.json was not valid JSON"),
             "expected helpful context; got: {msg}"
         );
+    }
+
+    /// The DeepSWE metric shape, copied verbatim from a real run's job-level
+    /// result.json. Before the `reward` fallback this scored 0.00 while the
+    /// task had in fact passed 44/44 fail-to-pass tests.
+    #[test]
+    fn deepswe_named_metrics_are_scored_not_silently_zeroed() {
+        let bytes = br#"{
+            "n_total_trials": 1,
+            "stats": {
+                "n_completed_trials": 1,
+                "n_errored_trials": 0,
+                "n_cancelled_trials": 0,
+                "evals": {
+                    "claude-code__tasks": {
+                        "n_trials": 1,
+                        "n_errors": 0,
+                        "metrics": [{
+                            "f2p": 1.0, "f2p_passed": 44.0, "f2p_total": 44.0,
+                            "p2p": 1.0, "p2p_passed": 2738.0, "p2p_total": 2738.0,
+                            "partial": 1.0, "reward": 1.0
+                        }]
+                    }
+                }
+            }
+        }"#;
+        let g = parse_harbor_result(bytes, TaskId("adaptix".into()), AgentConfig::ClaudeAlone)
+            .expect("DeepSWE metrics must parse");
+        assert_eq!(
+            g.score, 1.0,
+            "reward 1.0 must not be reported as 0.00; reason: {:?}",
+            g.reason
+        );
+    }
+
+    /// A DeepSWE loss must still be a loss — the fallback must not turn every
+    /// task into a pass.
+    #[test]
+    fn deepswe_zero_reward_stays_a_loss() {
+        let bytes = br#"{
+            "n_total_trials": 1,
+            "stats": {
+                "n_completed_trials": 1, "n_errored_trials": 0, "n_cancelled_trials": 0,
+                "evals": { "claude-code__tasks": {
+                    "n_trials": 1, "n_errors": 0,
+                    "metrics": [{ "reward": 0.0, "f2p": 0.0, "partial": 0.59 }]
+                }}
+            }
+        }"#;
+        let g = parse_harbor_result(bytes, TaskId("t".into()), AgentConfig::ClaudeAlone)
+            .expect("parse");
+        assert_eq!(
+            g.score, 0.0,
+            "partial credit must not be promoted to a pass"
+        );
+    }
+
+    /// Terminal-Bench's `mean` shape must keep working, and must win over
+    /// `reward` when both are present.
+    #[test]
+    fn terminal_bench_mean_still_takes_precedence() {
+        let bytes = br#"{
+            "n_total_trials": 1,
+            "stats": {
+                "n_completed_trials": 1, "n_errored_trials": 0, "n_cancelled_trials": 0,
+                "evals": { "terminal-bench__x": {
+                    "n_trials": 1, "n_errors": 0,
+                    "metrics": [{ "mean": 1.0, "reward": 0.0 }]
+                }}
+            }
+        }"#;
+        let g = parse_harbor_result(bytes, TaskId("t".into()), AgentConfig::ClaudeAlone)
+            .expect("parse");
+        assert_eq!(
+            g.score, 1.0,
+            "`mean` is the aggregate and must be preferred"
+        );
+    }
+
+    #[test]
+    fn capture_wrapper_maps_every_agent_we_actually_run() {
+        for (name, expected) in [
+            ("claude-code", "kbench_agents:CaptureClaudeCode"),
+            ("codex", "kbench_agents:CaptureCodex"),
+            ("oracle", "kbench_agents:CaptureOracle"),
+        ] {
+            assert_eq!(capture_agent_import_path(name).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn capture_wrapper_refuses_unknown_agent_rather_than_running_uncaptured() {
+        // The failure mode this guards against is silent: without a capture
+        // wrapper the separate verifier grades a pristine checkout and every
+        // task reports a perfectly plausible 0.00.
+        let err = capture_agent_import_path("mini-swe-agent")
+            .expect_err("unknown agent must not fall through to plain --agent");
+        let msg = err.to_string();
+        assert!(msg.contains("mini-swe-agent"), "got: {msg}");
+        assert!(msg.contains("silently scores 0"), "got: {msg}");
+    }
+
+    #[test]
+    fn missing_or_empty_model_patch_is_distinguishable_from_a_real_patch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trial = tmp.path().join("task__abc");
+        std::fs::create_dir_all(trial.join("artifacts")).unwrap();
+
+        assert_eq!(model_patch_bytes(&trial), None, "no file yet");
+
+        let patch = trial.join("artifacts").join("model.patch");
+        std::fs::write(&patch, b"").unwrap();
+        assert_eq!(model_patch_bytes(&trial), Some(0), "empty capture");
+
+        std::fs::write(&patch, b"diff --git a/x b/x\n").unwrap();
+        assert!(model_patch_bytes(&trial).is_some_and(|n| n > 0));
     }
 
     #[test]

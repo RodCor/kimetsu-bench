@@ -177,7 +177,8 @@ pub struct BrainbenchArgs {
     tiers: Vec<String>,
 
     /// Only run scenarios with these dimensions (comma-separated):
-    /// retrieval, dedup, importance, forgetting, calibration.
+    /// retrieval, dedup, importance, forgetting, calibration, write-precision,
+    /// poisoning, render-contract, graph, workflow.
     #[arg(long, value_delimiter = ',')]
     dimensions: Vec<String>,
 
@@ -192,6 +193,11 @@ pub struct BrainbenchArgs {
     /// Cheap-model id used by write-precision scenarios (`brain distill`).
     #[arg(long, default_value = "qwen2.5:3b")]
     distill_model: String,
+
+    /// Parallel scenario workers (each scenario runs in an isolated temp
+    /// workspace). 1 = sequential.
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
@@ -393,6 +399,19 @@ struct Cli {
     /// to `runs/auto/<timestamp>.md`. `json` does the same but in JSON.
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
     output: OutputFormat,
+
+    /// Run tasks from a local task directory instead of the Harbor registry
+    /// (forwarded as `harbor run --path`). Makes non-registry suites runnable
+    /// without conversion — e.g. `--task-path vendor/deep-swe/tasks`, whose
+    /// task.toml schema Harbor already parses.
+    ///
+    /// NOTE: a result produced this way is NOT a score on that suite's own
+    /// leaderboard — this driver runs Harbor's host agents, not whatever
+    /// harness the suite mandates, and `+km` arms add a memory sidecar. It is
+    /// valid for the internal A/B (both arms carry the same deviations), not
+    /// for external comparison. See the terminal_bench driver module docs.
+    #[arg(long)]
+    task_path: Option<String>,
 
     /// Run tasks from a named programming-language family defined in the
     /// families manifest (see --families-manifest). Example: `--family python`.
@@ -718,6 +737,37 @@ fn ingest_trial_outcome(workspace: &Path, run: &RunResult, grade: &Grade) {
 /// Run one trial in-process: run + grade, then (for real runs only)
 /// ingest the outcome into the shared brain and auto-accept proposals so
 /// the NEXT trial's broker query can see them. Used directly for dry-runs
+/// Absolutise a `--task-path` against the current directory.
+///
+/// Deliberately not `canonicalize()`: on Windows that returns an
+/// extended-length path prefix, which Harbor and Docker Compose both choke
+/// on. Joining with the cwd is enough — the only requirement is that the
+/// path still resolves from the worker's /tmp cwd.
+fn absolute_task_path(p: &str) -> String {
+    let path = std::path::Path::new(p);
+    if path.is_absolute() {
+        return p.to_string();
+    }
+    // Prefer the cwd when the path actually resolves there — that is the
+    // orchestrator, invoked from the bench dir, and it respects wherever the
+    // operator actually is.
+    if let Ok(cwd) = std::env::current_dir() {
+        let joined = cwd.join(path);
+        if joined.exists() {
+            return joined.to_string_lossy().into_owned();
+        }
+    }
+    // Otherwise anchor to the bench crate root. The worker deliberately runs
+    // with its cwd on /tmp (DrvFs handles go stale after Docker churn), so
+    // cwd-relative resolution there silently yields `/tmp/<path>` and Harbor
+    // dies with FileNotFoundError. Same anchor `default_families_manifest`
+    // uses.
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// and inside the single-trial worker.
 fn run_and_grade_trial(
     driver: &mut dyn BenchmarkDriver,
@@ -778,6 +828,14 @@ fn run_trial_isolated(
     }
     for ha in &cli.harbor_args {
         cmd.arg("--harbor-arg").arg(ha);
+    }
+    // A local task dir must reach the worker, and must be ABSOLUTE: the
+    // worker's cwd is /tmp (see below), not the bench dir, so a relative
+    // `--task-path vendor/deep-swe/tasks` would resolve to nothing there.
+    // Without this the worker silently falls back to the registry dataset
+    // and fails with "No tasks matched the filter(s)".
+    if let Some(tp) = &cli.task_path {
+        cmd.arg("--task-path").arg(absolute_task_path(tp));
     }
     cmd.arg("--no-build");
     cmd.arg("--worker-result").arg(&result_file);
@@ -1139,6 +1197,7 @@ fn run_brainbench_cmd(args: BrainbenchArgs, bench_dir: &Path) {
         limit: args.limit,
         distill_provider: args.distill_provider.clone(),
         distill_model: args.distill_model.clone(),
+        jobs: args.jobs,
     }
     .with_env_overlay();
 
@@ -1263,10 +1322,14 @@ fn main() {
             .replace(':', "-");
         bench_dir.join("local").join("runs").join(stamp)
     });
-    let ctx = DriverContext {
+    let mut ctx = DriverContext {
         work_dir: Some(run_root.clone()),
         ..DriverContext::default()
     };
+    if let Some(ref p) = cli.task_path {
+        ctx.overrides
+            .insert("tb_task_path".to_string(), absolute_task_path(p));
+    }
     let mut driver: Box<dyn BenchmarkDriver> = Box::new(TerminalBenchDriver::with_options(
         ctx,
         cli.dry_run,
