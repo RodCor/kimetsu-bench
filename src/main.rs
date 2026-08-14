@@ -177,7 +177,8 @@ pub struct BrainbenchArgs {
     tiers: Vec<String>,
 
     /// Only run scenarios with these dimensions (comma-separated):
-    /// retrieval, dedup, importance, forgetting, calibration.
+    /// retrieval, dedup, importance, forgetting, calibration, write-precision,
+    /// poisoning, render-contract, graph, workflow.
     #[arg(long, value_delimiter = ',')]
     dimensions: Vec<String>,
 
@@ -192,6 +193,11 @@ pub struct BrainbenchArgs {
     /// Cheap-model id used by write-precision scenarios (`brain distill`).
     #[arg(long, default_value = "qwen2.5:3b")]
     distill_model: String,
+
+    /// Parallel scenario workers (each scenario runs in an isolated temp
+    /// workspace). 1 = sequential.
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
@@ -1191,6 +1197,7 @@ fn run_brainbench_cmd(args: BrainbenchArgs, bench_dir: &Path) {
         limit: args.limit,
         distill_provider: args.distill_provider.clone(),
         distill_model: args.distill_model.clone(),
+        jobs: args.jobs,
     }
     .with_env_overlay();
 
