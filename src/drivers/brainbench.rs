@@ -1941,10 +1941,13 @@ fn retrieve_ranked_keys(
             "context response lacks a capsules array".into(),
         ));
     }
-    Ok(ranked_fixture_keys(&v, memories))
+    ranked_fixture_keys(&v, memories)
 }
 
-fn ranked_fixture_keys(v: &serde_json::Value, memories: &[Memory]) -> Vec<String> {
+fn ranked_fixture_keys(
+    v: &serde_json::Value,
+    memories: &[Memory],
+) -> Result<Vec<String>, BrainBenchError> {
     // Precompute normalized fixture text -> key.
     let norm_to_key: Vec<(String, String)> = memories
         .iter()
@@ -1953,8 +1956,12 @@ fn ranked_fixture_keys(v: &serde_json::Value, memories: &[Memory]) -> Vec<String
 
     let mut ranked: Vec<String> = Vec::new();
     if let Some(capsules) = v.get("capsules").and_then(|c| c.as_array()) {
-        for cap in capsules {
-            let summary = cap.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+        for (index, cap) in capsules.iter().enumerate() {
+            let summary = cap.get("summary").and_then(|s| s.as_str()).ok_or_else(|| {
+                BrainBenchError::KimetsuError(format!(
+                    "context response capsule {index} lacks a string summary"
+                ))
+            })?;
             let body = normalize(strip_prefix_summary(summary));
             // Match the capsule body against fixture memory texts. Prefer exact
             // normalized equality; fall back to substring containment either way
@@ -1986,7 +1993,7 @@ fn ranked_fixture_keys(v: &serde_json::Value, memories: &[Memory]) -> Vec<String
             }
         }
     }
-    ranked
+    Ok(ranked)
 }
 
 /// Run `brain memory conflicts --json` and return its stdout. Non-fatal: returns
@@ -4540,10 +4547,24 @@ mod tests {
         let payload = serde_json::json!({"capsules": [
             {"summary": "unmatched evidence"}, {"summary": "known evidence"}
         ]});
-        let ranked = ranked_fixture_keys(&payload, &memories);
+        let ranked = ranked_fixture_keys(&payload, &memories).unwrap();
         assert_eq!(ranked.len(), 2);
         assert_eq!(mrr(&ranked, &["known".into()]), 0.5);
         assert_eq!(retrieval_score(&ranked, &[], &[]), 0.0);
+    }
+
+    #[test]
+    fn malformed_capsule_summary_is_an_error() {
+        for malformed in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"summary": null}),
+            serde_json::json!({"summary": 42}),
+        ] {
+            let payload = serde_json::json!({"capsules": [malformed]});
+            let error = ranked_fixture_keys(&payload, &[]).unwrap_err();
+            assert!(error.to_string().contains("capsule 0"));
+        }
     }
 
     #[test]

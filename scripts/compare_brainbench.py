@@ -40,10 +40,21 @@ def compare_reports(baseline, candidate):
     keys = set(bases[0])
     if not keys or any(set(run) != keys for run in bases + candidates):
         raise ValueError("scenario sets differ or are empty; comparisons must use identical fixtures")
-    rows, unpaired = [], []
+    rows, unpaired, unpaired_details = [], [], []
     for key in sorted(keys):
-        if any(run[key]["skipped"] for run in bases + candidates):
+        reasons = []
+        for label, runs in (("baseline", bases), ("candidate", candidates)):
+            for repeat, run in enumerate(runs, 1):
+                row = run[key]
+                if row["skipped"]:
+                    reasons.append(dict(side=label, repeat=repeat, kind="skipped",
+                                        detail=row["detail"]))
+                elif row["detail"].startswith("error:"):
+                    reasons.append(dict(side=label, repeat=repeat, kind="error",
+                                        detail=row["detail"]))
+        if reasons:
             unpaired.append(key)
+            unpaired_details.append(dict(identity=key, reasons=reasons))
             continue
         a = statistics.mean(run[key]["score"] for run in bases)
         b = statistics.mean(run[key]["score"] for run in candidates)
@@ -67,6 +78,7 @@ def compare_reports(baseline, candidate):
     errors = lambda reports: sum(row["detail"].startswith("error:")
                                  for report in reports for row in report["scenarios"])
     return dict(by_dimension=dimensions, scenarios=rows, unpaired_scenarios=unpaired,
+                unpaired_details=unpaired_details,
                 baseline_errors=errors(baseline), candidate_errors=errors(candidate),
                 repeats=len(baseline),
                 uncertainty_note="Exploratory paired bootstrap over scenario IDs after averaging repeats; correlated task families require a separate grouped holdout.")
@@ -116,6 +128,18 @@ def markdown(result):
     return "\n".join(lines) + "\n"
 
 
+def text_output(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def persist_result(path, result):
+    path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["kbench", "baseline", "candidate", "dataset", "out"]:
@@ -137,7 +161,7 @@ def main():
     overrides = {key: env[key] for key in ["KIMETSU_BRAIN_EMBEDDER", "KIMETSU_ABSTAIN_EVIDENCE",
                  "KIMETSU_DETECT_CONFLICTS", "KIMETSU_RESOLVE_CONFLICTS", "KIMETSU_INTRA_THREADS",
                  "FASTEMBED_CACHE_DIR"] if key in env}
-    result = dict(schema_version=1, harness=fingerprint(args.kbench),
+    result = dict(schema_version=1, status="running", harness=fingerprint(args.kbench),
                   binaries={k: fingerprint(v) for k,v in binaries.items()},
                   datasets=dataset_fingerprints(args.dataset),
                   settings=dict(budget_tokens=args.budget_tokens, dimensions=sorted(dimensions),
@@ -150,22 +174,53 @@ def main():
                    "--dimensions", ",".join(sorted(dimensions)), "--jobs", "1", "--output", "json"]
             print(f"repeat {repeat+1}/{args.repeats}: {label}", flush=True)
             start = time.perf_counter()
-            completed = subprocess.run(cmd, env=env, capture_output=True, timeout=args.timeout_seconds,
-                                       encoding="utf-8", errors="strict")
-            elapsed = time.perf_counter() - start
             stem = args.out / f"{repeat+1}-{label}"
+            run_record = dict(label=label, repeat=repeat+1)
+            try:
+                completed = subprocess.run(cmd, env=env, capture_output=True,
+                                           timeout=args.timeout_seconds, encoding="utf-8",
+                                           errors="strict")
+            except subprocess.TimeoutExpired as error:
+                run_record["wall_seconds"] = time.perf_counter() - start
+                run_record["failure"] = dict(kind="timeout", timeout_seconds=args.timeout_seconds,
+                                              message=str(error))
+                stem.with_suffix(".stdout.log").write_text(text_output(error.output), encoding="utf-8")
+                stem.with_suffix(".stderr.log").write_text(text_output(error.stderr), encoding="utf-8")
+                result["runs"].append(run_record)
+                result["status"] = "incomplete"
+                persist_result(args.out / "comparison.json", result)
+                return 1
+            elapsed = time.perf_counter() - start
+            stem.with_suffix(".stdout.log").write_text(completed.stdout, encoding="utf-8")
             stem.with_suffix(".stderr.log").write_text(completed.stderr, encoding="utf-8")
+            run_record["wall_seconds"] = elapsed
             if completed.returncode:
-                raise RuntimeError(f"{label} exited {completed.returncode}; see {stem}.stderr.log")
-            report = json.loads(completed.stdout)
+                run_record["failure"] = dict(kind="nonzero_exit",
+                                              returncode=completed.returncode,
+                                              message=f"{label} exited {completed.returncode}")
+                result["runs"].append(run_record)
+                result["status"] = "incomplete"
+                persist_result(args.out / "comparison.json", result)
+                return 1
+            try:
+                report = json.loads(completed.stdout)
+            except json.JSONDecodeError as error:
+                run_record["failure"] = dict(kind="invalid_json", message=str(error))
+                result["runs"].append(run_record)
+                result["status"] = "incomplete"
+                persist_result(args.out / "comparison.json", result)
+                return 1
             stem.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             reports[label].append(report)
-            result["runs"].append(dict(label=label, repeat=repeat+1, wall_seconds=elapsed,
-                                       report_file=stem.with_suffix(".json").name))
+            run_record["report_file"] = stem.with_suffix(".json").name
+            result["runs"].append(run_record)
+            persist_result(args.out / "comparison.json", result)
     result["comparison"] = compare_reports(reports["baseline"], reports["candidate"])
-    (args.out / "comparison.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    result["status"] = "complete"
+    persist_result(args.out / "comparison.json", result)
     (args.out / "comparison.md").write_text(markdown(result), encoding="utf-8")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
