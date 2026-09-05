@@ -1843,6 +1843,15 @@ fn resolve_kimetsu_bin(cfg: &BrainBenchConfig) -> String {
 ///
 /// EVERY kimetsu call sets `KIMETSU_USER_BRAIN=0` so the global cross-project
 /// brain cannot leak pre-existing memories into measurements.
+fn reranker_config_overrides(reranker: &str) -> Vec<(&str, &str)> {
+    // New projects select the deep preset, which overwrites concrete models
+    // during configuration loading. Leave preset mode before selecting one.
+    vec![
+        ("retrieval.level", "custom"),
+        ("embedder.reranker", reranker),
+    ]
+}
+
 fn setup_brain(kimetsu_bin: &str) -> Result<tempfile::TempDir, BrainBenchError> {
     let tmp = tempfile::Builder::new()
         .prefix("kbench-brain-")
@@ -1878,17 +1887,19 @@ fn setup_brain(kimetsu_bin: &str) -> Result<tempfile::TempDir, BrainBenchError> 
     }
 
     if let Ok(reranker) = std::env::var("KBENCH_RERANKER") {
-        let configured = Command::new(kimetsu_bin)
-            .current_dir(workspace)
-            .env("KIMETSU_USER_BRAIN", "0")
-            .args(["config", "set", "embedder.reranker", &reranker])
-            .output()
-            .map_err(|e| BrainBenchError::KimetsuError(format!("set reranker: {e}")))?;
-        if !configured.status.success() {
-            return Err(BrainBenchError::KimetsuError(format!(
-                "set reranker failed: {}",
-                String::from_utf8_lossy(&configured.stderr)
-            )));
+        for (key, value) in reranker_config_overrides(&reranker) {
+            let configured = Command::new(kimetsu_bin)
+                .current_dir(workspace)
+                .env("KIMETSU_USER_BRAIN", "0")
+                .args(["config", "set", key, value])
+                .output()
+                .map_err(|e| BrainBenchError::KimetsuError(format!("set {key}: {e}")))?;
+            if !configured.status.success() {
+                return Err(BrainBenchError::KimetsuError(format!(
+                    "set {key} failed: {}",
+                    String::from_utf8_lossy(&configured.stderr)
+                )));
+            }
         }
     }
 
@@ -3985,6 +3996,23 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_override_survives_new_project_retrieval_preset() {
+        for model in ["ms-marco-minilm-l-4-v2", "off"] {
+            let mut config = kimetsu_core::config::ProjectConfig::default_for_project("benchmark");
+            config.retrieval.level = "deep".into();
+            for (key, value) in reranker_config_overrides(model) {
+                match key {
+                    "retrieval.level" => config.retrieval.level = value.into(),
+                    "embedder.reranker" => config.embedder.reranker = value.into(),
+                    _ => panic!("unexpected override {key}"),
+                }
+                config.apply_retrieval_level();
+            }
+            assert_eq!(config.embedder.reranker, model);
+        }
+    }
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
