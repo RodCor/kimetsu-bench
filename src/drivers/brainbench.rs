@@ -646,8 +646,11 @@ pub struct BrainBenchReport {
     /// Per-dimension mean + n + 95% CI (skipped scenarios excluded).
     #[serde(default)]
     pub by_dimension: BTreeMap<String, DimensionStat>,
-    /// Mean score over NON-skipped scenarios (0.0–1.0).
+    /// Equal-weight mean over measured dimensions (0.0–1.0).
     pub overall_index: f64,
+    /// Historical scenario-weighted mean, retained as a diagnostic only.
+    #[serde(default)]
+    pub scenario_weighted_index: f64,
 }
 
 impl BrainBenchReport {
@@ -664,6 +667,10 @@ impl BrainBenchReport {
             self.overall_index * 100.0,
             total,
             skipped
+        ));
+        out.push_str(&format!(
+            "The headline weights measured dimensions equally. Scenario-weighted diagnostic: {:.1}%. Neither score estimates agent task success.\n\n",
+            self.scenario_weighted_index * 100.0
         ));
 
         out.push_str("## By dimension (n, 95% CI)\n\n");
@@ -1889,7 +1896,7 @@ fn strip_prefix_summary(summary: &str) -> &str {
 /// parses the `capsules` array (already score-sorted), strips each capsule
 /// `summary`'s prefix, normalizes it, and matches against the normalized text of
 /// each fixture Memory to recover its `key`. Capsules that match no fixture
-/// memory are dropped. Order is preserved.
+/// memory retain an unmatched placeholder so rank and injection counts remain honest.
 fn retrieve_ranked_keys(
     workspace: &Path,
     kimetsu_bin: &str,
@@ -1929,7 +1936,15 @@ fn retrieve_ranked_keys(
             "brain context returned non-JSON output: {e}\n{stdout}"
         ))
     })?;
+    if !v.get("capsules").is_some_and(serde_json::Value::is_array) {
+        return Err(BrainBenchError::KimetsuError(
+            "context response lacks a capsules array".into(),
+        ));
+    }
+    Ok(ranked_fixture_keys(&v, memories))
+}
 
+fn ranked_fixture_keys(v: &serde_json::Value, memories: &[Memory]) -> Vec<String> {
     // Precompute normalized fixture text -> key.
     let norm_to_key: Vec<(String, String)> = memories
         .iter()
@@ -1941,26 +1956,37 @@ fn retrieve_ranked_keys(
         for cap in capsules {
             let summary = cap.get("summary").and_then(|s| s.as_str()).unwrap_or("");
             let body = normalize(strip_prefix_summary(summary));
-            if body.is_empty() {
-                continue;
-            }
             // Match the capsule body against fixture memory texts. Prefer exact
             // normalized equality; fall back to substring containment either way
             // (the summary may truncate or lightly reword the stored text).
-            let matched = norm_to_key
+            let exact: Vec<_> = norm_to_key
                 .iter()
-                .find(|(norm, _)| *norm == body)
-                .or_else(|| {
-                    norm_to_key
-                        .iter()
-                        .find(|(norm, _)| body.contains(norm.as_str()) || norm.contains(&body))
-                });
-            if let Some((_, key)) = matched {
+                .filter(|(norm, _)| !body.is_empty() && *norm == body)
+                .collect();
+            let matches = if exact.is_empty() {
+                norm_to_key
+                    .iter()
+                    .filter(|(norm, _)| {
+                        !body.is_empty()
+                            && !norm.is_empty()
+                            && (body.contains(norm.as_str()) || norm.contains(&body))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                exact
+            };
+            if let [(_, key)] = matches.as_slice() {
                 ranked.push(key.clone());
+            } else {
+                let mut unknown = format!("__unmatched_{}__", ranked.len());
+                while memories.iter().any(|m| m.key == unknown) {
+                    unknown.push('_');
+                }
+                ranked.push(unknown);
             }
         }
     }
-    Ok(ranked)
+    ranked
 }
 
 /// Run `brain memory conflicts --json` and return its stdout. Non-fatal: returns
@@ -1988,6 +2014,18 @@ fn detect_conflicts_payload(workspace: &Path, kimetsu_bin: &str) -> String {
 // ─── Per-dimension runners ───────────────────────────────────────────────────
 
 /// Retrieval correctness: recall@4 + MRR + resolution for knowledge-update.
+fn retrieval_score(ranked: &[String], relevant: &[String], stale: &[String]) -> f64 {
+    if relevant.is_empty() {
+        return if ranked.is_empty() { 1.0 } else { 0.0 };
+    }
+    let recall = recall_at_k(ranked, relevant, 4);
+    if stale.is_empty() || resolution_correct(ranked, relevant, stale) {
+        recall
+    } else {
+        0.0
+    }
+}
+
 fn run_retrieval(
     scenario: &Scenario,
     workspace: &Path,
@@ -2009,6 +2047,7 @@ fn run_retrieval(
     let mut mrrs: Vec<f64> = Vec::new();
     let mut stale_hits: Vec<f64> = Vec::new();
     let mut resolutions: Vec<f64> = Vec::new();
+    let mut negative_injections = Vec::new();
 
     for q in &scenario.queries {
         let ranked =
@@ -2017,28 +2056,33 @@ fn run_retrieval(
         let m = mrr(&ranked, &q.relevant);
         let sh = stale_hit_rate(&ranked, &q.stale, 4);
         let res = resolution_correct(&ranked, &q.relevant, &q.stale);
-        recalls.push(r4);
-        mrrs.push(m);
-        stale_hits.push(sh);
-        resolutions.push(if res { 1.0 } else { 0.0 });
+        if q.relevant.is_empty() {
+            negative_injections.push(if ranked.is_empty() { 0.0 } else { 1.0 });
+        } else {
+            recalls.push(r4);
+            mrrs.push(m);
+        }
+        if !q.stale.is_empty() {
+            stale_hits.push(sh);
+            resolutions.push(if res { 1.0 } else { 0.0 });
+        }
 
         // Per-query blended score: recall@4, gated by resolution when the query
         // plants a stale memory (a "current value" must outrank the old one).
-        let blended = if q.stale.is_empty() {
-            r4
-        } else {
-            r4 * if res { 1.0 } else { 0.0 }
-        };
+        let blended = retrieval_score(&ranked, &q.relevant, &q.stale);
         per_query_scores.push(blended);
     }
 
     let score = mean(&per_query_scores);
     let detail = format!(
-        "recall@4={:.2} mrr={:.2} stale-hit={:.2} resolution={:.2} ({} quer{})",
+        "positive-recall@4={:.2} mrr={:.2} stale-hit={} resolution={} false-injection={} positive-n={} negative-n={} ({} quer{})",
         mean(&recalls),
         mean(&mrrs),
-        mean(&stale_hits),
-        mean(&resolutions),
+        optional_metric(&stale_hits),
+        optional_metric(&resolutions),
+        optional_metric(&negative_injections),
+        recalls.len(),
+        negative_injections.len(),
         scenario.queries.len(),
         if scenario.queries.len() == 1 {
             "y"
@@ -2047,6 +2091,14 @@ fn run_retrieval(
         }
     );
     Ok(skeleton_result(scenario, score, detail))
+}
+
+fn optional_metric(values: &[f64]) -> String {
+    if values.is_empty() {
+        "n/a".into()
+    } else {
+        format!("{:.3} (n={})", mean(values), values.len())
+    }
 }
 
 /// Workflow stream: one persistent brain, ordered episodes; per episode the
@@ -3614,7 +3666,8 @@ fn build_report(results: Vec<ScenarioResult>, dataset_path: &Path) -> BrainBench
         .filter(|r| !r.skipped)
         .map(|r| r.score)
         .collect();
-    let overall_index = mean(&scored);
+    let scenario_weighted_index = mean(&scored);
+    let overall_index = mean(&by_dimension.values().map(|d| d.mean).collect::<Vec<_>>());
 
     BrainBenchReport {
         generated_at: now,
@@ -3623,6 +3676,7 @@ fn build_report(results: Vec<ScenarioResult>, dataset_path: &Path) -> BrainBench
         by_dimension_tier,
         by_dimension,
         overall_index,
+        scenario_weighted_index,
     }
 }
 
@@ -4444,6 +4498,53 @@ mod tests {
     }
 
     // ── Report building ───────────────────────────────────────────────────────
+
+    #[test]
+    fn report_does_not_let_calibration_volume_hide_failed_retrieval() {
+        let mut results = vec![ScenarioResult {
+            id: "retrieval-miss".into(),
+            dimension: Dimension::Retrieval,
+            tier: Tier::Easy,
+            score: 0.0,
+            skipped: false,
+            detail: "miss".into(),
+        }];
+        for i in 0..9 {
+            results.push(ScenarioResult {
+                id: format!("calibration-{i}"),
+                dimension: Dimension::Calibration,
+                tier: Tier::Easy,
+                score: 1.0,
+                skipped: false,
+                detail: "ok".into(),
+            });
+        }
+        let report = build_report(results, Path::new("test.json"));
+        assert_eq!(report.overall_index, 0.5);
+    }
+
+    #[test]
+    fn irrelevant_memory_is_not_perfect_no_answer_retrieval() {
+        assert_eq!(retrieval_score(&["unrelated".into()], &[], &[]), 0.0);
+        assert_eq!(retrieval_score(&[], &[], &[]), 1.0);
+    }
+
+    #[test]
+    fn unknown_capsules_keep_their_rank_and_count_as_injection() {
+        let memories = vec![Memory {
+            key: "known".into(),
+            text: "known evidence".into(),
+            scope: "project".into(),
+            kind: "fact".into(),
+        }];
+        let payload = serde_json::json!({"capsules": [
+            {"summary": "unmatched evidence"}, {"summary": "known evidence"}
+        ]});
+        let ranked = ranked_fixture_keys(&payload, &memories);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(mrr(&ranked, &["known".into()]), 0.5);
+        assert_eq!(retrieval_score(&ranked, &[], &[]), 0.0);
+    }
 
     #[test]
     fn build_report_excludes_skipped_from_index() {
