@@ -56,6 +56,12 @@ class PairedComparisonTests(unittest.TestCase):
         self.assertEqual(compare_brainbench.environment_for_side(base, None)["KIMETSU_INTRA_THREADS"], "8")
         self.assertEqual(base["KIMETSU_INTRA_THREADS"], "8")
 
+    def test_side_model_overrides_allow_a_paired_reranker_comparison(self):
+        base = {"KBENCH_RERANKER":"ms-marco-tinybert-l-2-v2"}
+        self.assertEqual(compare_brainbench.environment_for_side(base, None, "off")["KBENCH_RERANKER"], "off")
+        self.assertEqual(compare_brainbench.environment_for_side(base, 4, "ms-marco-minilm-l-4-v2")["KBENCH_RERANKER"], "ms-marco-minilm-l-4-v2")
+        self.assertEqual(compare_brainbench.environment_for_side(base, None)["KBENCH_RERANKER"], base["KBENCH_RERANKER"])
+
     def test_query_measurements_separate_recall_hit_and_first_query_latency(self):
         base = report([("a", "retrieval", .5)])
         base["scenarios"][0]["observations"] = [

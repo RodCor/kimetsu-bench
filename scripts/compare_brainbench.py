@@ -267,12 +267,14 @@ def persist_result(path, result):
     path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
 
-def environment_for_side(base, threads):
+def environment_for_side(base, threads, reranker=None):
     result = dict(base)
     if threads == 0:
         result.pop("KIMETSU_INTRA_THREADS", None)
     elif threads is not None:
         result["KIMETSU_INTRA_THREADS"] = str(threads)
+    if reranker is not None:
+        result["KBENCH_RERANKER"] = reranker
     return result
 
 
@@ -286,6 +288,8 @@ def main():
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--baseline-threads", type=int, help="0 unsets the override; omitted inherits environment")
     parser.add_argument("--candidate-threads", type=int, help="0 unsets the override; omitted inherits environment")
+    parser.add_argument("--baseline-reranker", help="Override reranker only in baseline temporary projects")
+    parser.add_argument("--candidate-reranker", help="Override reranker only in candidate temporary projects")
     args = parser.parse_args()
     dimensions = set(args.dimensions.split(","))
     if not dimensions or not dimensions <= OFFLINE_DIMENSIONS:
@@ -301,12 +305,13 @@ def main():
     overrides = {key: env[key] for key in ["KIMETSU_BRAIN_EMBEDDER", "KIMETSU_ABSTAIN_EVIDENCE",
                  "KIMETSU_DETECT_CONFLICTS", "KIMETSU_RESOLVE_CONFLICTS", "KIMETSU_INTRA_THREADS",
                  "FASTEMBED_CACHE_DIR", "KBENCH_RERANKER"] if key in env}
-    result = dict(schema_version=1, status="running", harness=fingerprint(args.kbench),
+    result = dict(schema_version=1, status="running", harness=fingerprint(args.kbench), runner=fingerprint(Path(__file__)),
                   binaries={k: fingerprint(v) for k,v in binaries.items()},
                   datasets=dataset_fingerprints(args.dataset),
                   settings=dict(budget_tokens=args.budget_tokens, dimensions=sorted(dimensions),
                                 jobs=1, overrides=overrides,
-                                baseline_threads=args.baseline_threads, candidate_threads=args.candidate_threads), runs=[])
+                                baseline_threads=args.baseline_threads, candidate_threads=args.candidate_threads,
+                                baseline_reranker=args.baseline_reranker, candidate_reranker=args.candidate_reranker), runs=[])
     reports = {"baseline": [], "candidate": []}
     for repeat in range(args.repeats):
         for label in (["baseline", "candidate"] if repeat % 2 == 0 else ["candidate", "baseline"]):
@@ -317,8 +322,9 @@ def main():
             start = time.perf_counter()
             stem = args.out / f"{repeat+1}-{label}"
             run_record = dict(label=label, repeat=repeat+1)
-            run_env = environment_for_side(env, getattr(args, f"{label}_threads"))
+            run_env = environment_for_side(env, getattr(args, f"{label}_threads"), getattr(args, f"{label}_reranker"))
             run_record["intra_threads_override"] = run_env.get("KIMETSU_INTRA_THREADS")
+            run_record["reranker_override"] = run_env.get("KBENCH_RERANKER")
             try:
                 completed = run_owned_tree(cmd, env=run_env, timeout=args.timeout_seconds)
             except subprocess.TimeoutExpired as error:
