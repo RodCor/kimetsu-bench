@@ -10,6 +10,22 @@ import compare_brainbench
 from compare_brainbench import compare_reports
 
 
+class ProcessOwnershipTests(unittest.TestCase):
+    def test_timeout_terminates_descendants_before_parent_exit(self):
+        import os
+        import time
+        with tempfile.TemporaryDirectory() as folder:
+            marker = Path(folder) / "orphan-ran"
+            child = "import time,pathlib; time.sleep(2); pathlib.Path(%r).write_text('orphan')" % str(marker)
+            parent = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',%r]); print('ready',flush=True); time.sleep(30)" % child
+            start = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                compare_brainbench.run_owned_tree([sys.executable, "-c", parent], env=dict(os.environ), timeout=.5)
+            elapsed = time.monotonic() - start
+            time.sleep(max(0, 2.4 - elapsed))
+            self.assertFalse(marker.exists(), "timed-out inference descendant survived")
+
+
 def report(rows):
     return {"scenarios": [dict(id=key, dimension=dim, score=value,
                                skipped=False, detail="ok") for key, dim, value in rows]}
@@ -95,9 +111,9 @@ class RunnerFailureTests(unittest.TestCase):
                 "--out", str(self.root / "out"), "--repeats", "1"]
 
     def assert_incomplete_failure(self, side_effect, kind):
-        run_patch = (mock.patch.object(subprocess, "run", side_effect=side_effect)
+        run_patch = (mock.patch.object(compare_brainbench, "run_owned_tree", side_effect=side_effect)
                      if isinstance(side_effect, BaseException)
-                     else mock.patch.object(subprocess, "run", return_value=side_effect))
+                     else mock.patch.object(compare_brainbench, "run_owned_tree", return_value=side_effect))
         with mock.patch.object(sys, "argv", self.argv()), run_patch:
             rc = compare_brainbench.main()
         artifact = json.loads((self.root / "out" / "comparison.json").read_text(encoding="utf-8"))
@@ -130,7 +146,7 @@ class RunnerFailureTests(unittest.TestCase):
         candidate = subprocess.CompletedProcess(
             [], 0, stdout=json.dumps(report([("b", "retrieval", 1)])), stderr="")
         with mock.patch.object(sys, "argv", self.argv()), \
-             mock.patch.object(subprocess, "run", side_effect=[baseline, candidate]):
+             mock.patch.object(compare_brainbench, "run_owned_tree", side_effect=[baseline, candidate]):
             rc = compare_brainbench.main()
         artifact = json.loads((self.root / "out" / "comparison.json").read_text(encoding="utf-8"))
         self.assertEqual(rc, 1)
@@ -144,7 +160,7 @@ class RunnerFailureTests(unittest.TestCase):
                 ("a", "retrieval", 0), ("a", "retrieval", 1)
             ])), stderr="")
         with mock.patch.object(sys, "argv", self.argv()), \
-             mock.patch.object(subprocess, "run", return_value=duplicate):
+             mock.patch.object(compare_brainbench, "run_owned_tree", return_value=duplicate):
             rc = compare_brainbench.main()
         artifact = json.loads((self.root / "out" / "comparison.json").read_text(encoding="utf-8"))
         self.assertEqual(rc, 1)

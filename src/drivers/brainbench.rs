@@ -906,7 +906,7 @@ pub fn score_workflow_episode(
         (None, _) => false,
     };
     let r = recall_at_k(ranked, relevant, k);
-    let resolution_ok = stale.is_empty() || resolution_correct(ranked, relevant, stale);
+    let resolution_ok = stale_hit_rate(ranked, stale, k) == 0.0;
     let score = if trap_hit || !resolution_ok { 0.0 } else { r };
     EpisodeScore {
         score,
@@ -4001,8 +4001,10 @@ mod tests {
         // Stale outranks relevant -> gated to 0 despite recall hit.
         let es = score_workflow_episode(&s(&["old", "new"]), &s(&["new"]), &s(&["old"]), &[], 4);
         assert_eq!(es.score, 0.0);
-        // Relevant outranks stale -> full recall credit.
+        // Even below the correct answer, stale context violates the contract.
         let es = score_workflow_episode(&s(&["new", "old"]), &s(&["new"]), &s(&["old"]), &[], 4);
+        assert_eq!(es.score, 0.0);
+        let es = score_workflow_episode(&s(&["new"]), &s(&["new"]), &s(&["old"]), &[], 4);
         assert_eq!(es.score, 1.0);
     }
 

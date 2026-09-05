@@ -11,9 +11,42 @@ import math
 import os
 from pathlib import Path
 import random
+import signal
 import statistics
 import subprocess
 import time
+
+
+def run_owned_tree(cmd, *, env, timeout):
+    """Kill descendants while the parent still exists, before reaping it.
+
+    subprocess.run kills only the parent on timeout. Inference children can
+    otherwise survive, including on Windows where process groups do not die
+    with their parent. The timeout applies to the whole benchmark invocation.
+    """
+    options = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else dict(start_new_session=True)
+    process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               encoding="utf-8", errors="strict", **options)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException as error:
+        if os.name == "nt":
+            # /T walks descendants before /F terminates their parent; do not
+            # call process.kill first, which loses Windows tree ancestry.
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if process.poll() is None:
+            process.kill()
+        stdout, stderr = process.communicate(timeout=15)
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr) from error
+        raise
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 OFFLINE_DIMENSIONS = {
     "retrieval", "dedup", "importance", "forgetting", "calibration",
@@ -277,9 +310,7 @@ def main():
             run_env = environment_for_side(env, getattr(args, f"{label}_threads"))
             run_record["intra_threads_override"] = run_env.get("KIMETSU_INTRA_THREADS")
             try:
-                completed = subprocess.run(cmd, env=run_env, capture_output=True,
-                                           timeout=args.timeout_seconds, encoding="utf-8",
-                                           errors="strict")
+                completed = run_owned_tree(cmd, env=run_env, timeout=args.timeout_seconds)
             except subprocess.TimeoutExpired as error:
                 run_record["wall_seconds"] = time.perf_counter() - start
                 run_record["failure"] = dict(kind="timeout", timeout_seconds=args.timeout_seconds,

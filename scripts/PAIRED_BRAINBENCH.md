@@ -15,6 +15,8 @@ Each scenario is paired by dimension and ID. Repeats are averaged within a scena
 
 `comparison.json` is written as the run progresses. A command failure, timeout, invalid JSON/report response, or final identity-validation failure leaves it with `status: "incomplete"`, structured failure evidence, and all completed run records; the process exits nonzero and does not write a completed Markdown comparison.
 
+The whole-run timeout terminates descendants before reaping `kbench` (Windows `taskkill /T`, Unix process group). This prevents a hung MCP inference child from surviving a timed-out comparison and competing with the next run. The deadline covers seeding and queries together; it is not a per-query latency cutoff.
+
 BrainBench's headline now weights measured dimensions equally; the old scenario-weighted average remains a diagnostic. No-answer queries score abstention, not the vacuous recall of an empty relevant set. Positive recall and negative injection rates use separate denominators, and stale correctness is reported as unavailable when no stale cases exist. Unmatched or ambiguous returned capsules retain their rank and count as injected material.
 
 Retrieval and workflow scenarios query the production `kimetsu_brain_context` tool through a persistent stdio MCP process. Workflow writes happen through a separate process while MCP stays alive, exercising index freshness. The render-contract dimension retains its explicit CLI rendering check. Invalid MCP responses fail the scenario instead of masquerading as abstention. Current-context retrieval scores become zero if any explicitly stale gold item is delivered in the top four, even below the correct answer; the older ordering-only resolution metric remains diagnostic.
