@@ -140,6 +140,7 @@ def measurement_summary(reports, paired_keys):
         return sorted(values)[max(0, math.ceil(len(values)*p)-1)] if values else None
     return dict(unique_queries=len(groups), query_observations=count,
                 positive_queries=len(metrics["positive_recall_at_4"]), negative_queries=len(metrics["negative_injection"]),
+                stale_queries=len(metrics["stale_injection"]),
                 positive_recall_at_4=avg(metrics["positive_recall_at_4"]),
                 positive_hit_at_4=avg(metrics["positive_hit_at_4"]), positive_mrr=avg(metrics["positive_mrr"]),
                 negative_injection_rate=avg(metrics["negative_injection"]), stale_injection_rate=avg(metrics["stale_injection"]),
