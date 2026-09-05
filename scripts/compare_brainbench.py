@@ -105,6 +105,7 @@ def measurement_summary(reports, paired_keys):
     metric_names = ["positive_recall_at_4", "positive_hit_at_4", "positive_mrr", "negative_injection", "stale_injection"]
     metrics = {name: [] for name in metric_names}
     first, subsequent, text_bytes, result_bytes = [], [], [], []
+    working_sets, peak_working_sets = [], []
     count = 0
     for observations in groups.values():
         for name in metric_names:
@@ -124,6 +125,12 @@ def measurement_summary(reports, paired_keys):
             (first if observation["first_query"] else subsequent).append(observation["latency_ms"])
             text_bytes.append(observation["model_text_bytes"])
             result_bytes.append(observation["mcp_result_bytes"])
+            for field, values in [("working_set_bytes", working_sets), ("peak_working_set_bytes", peak_working_sets)]:
+                value = observation.get(field)
+                if value is not None:
+                    if isinstance(value, bool) or not isinstance(value, (int,float)) or not math.isfinite(value) or value < 0:
+                        raise ValueError(f"invalid memory measurement {field}")
+                    values.append(value)
     avg = lambda values: statistics.mean(values) if values else None
     def percentile(values, p):
         return sorted(values)[max(0, math.ceil(len(values)*p)-1)] if values else None
@@ -135,6 +142,8 @@ def measurement_summary(reports, paired_keys):
                 first_query_mean_ms=avg(first), subsequent_query_p50_ms=percentile(subsequent,.5),
                 subsequent_query_p95_ms=percentile(subsequent,.95), subsequent_observations=len(subsequent),
                 mean_model_text_bytes=avg(text_bytes), mean_mcp_result_bytes=avg(result_bytes),
+                memory_observations=len(working_sets), mean_mcp_working_set_bytes=avg(working_sets),
+                max_mcp_peak_working_set_bytes=max(peak_working_sets) if peak_working_sets else None,
                 note="Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately.")
 
 
@@ -234,13 +243,14 @@ def markdown(result):
         lines.append(f"{label}: mean complete-run time {statistics.mean(values):.2f} s ({len(values)} repeats).")
     if any(compare["measurement_summary"].values()):
         lines += ["", "Query measurements through persistent MCP (subsequent queries reuse the process):", "",
-                  "| Build | Positive hit@4 | Positive recall@4 | False injection | Subsequent p50 / p95 ms | Mean MCP result bytes |",
-                  "|---|---:|---:|---:|---:|---:|"]
+                  "| Build | Positive hit@4 | Positive recall@4 | False injection | Subsequent p50 / p95 ms | Mean MCP result bytes | Peak MCP working set MiB |",
+                  "|---|---:|---:|---:|---:|---:|---:|"]
         def fmt(value):
             return "n/a" if value is None else f"{value:.3f}"
         for label, summary in compare["measurement_summary"].items():
             if summary is not None:
-                lines.append(f"| {label} | {fmt(summary['positive_hit_at_4'])} | {fmt(summary['positive_recall_at_4'])} | {fmt(summary['negative_injection_rate'])} | {fmt(summary['subsequent_query_p50_ms'])} / {fmt(summary['subsequent_query_p95_ms'])} | {fmt(summary['mean_mcp_result_bytes'])} |")
+                peak = summary['max_mcp_peak_working_set_bytes']
+                lines.append(f"| {label} | {fmt(summary['positive_hit_at_4'])} | {fmt(summary['positive_recall_at_4'])} | {fmt(summary['negative_injection_rate'])} | {fmt(summary['subsequent_query_p50_ms'])} / {fmt(summary['subsequent_query_p95_ms'])} | {fmt(summary['mean_mcp_result_bytes'])} | {fmt(peak / 1048576 if peak is not None else None)} |")
         lines.append("\nMeasured bytes include JSON escaping; reported token estimates are retained per query but may use different accounting rules across builds. Query timing excludes the separately recorded MCP initialization and corpus seeding.")
     return "\n".join(lines) + "\n"
 

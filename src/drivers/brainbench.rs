@@ -635,6 +635,8 @@ pub struct QueryObservation {
     pub mcp_result_bytes: usize,
     pub wire_bytes: usize,
     pub reported_used_tokens: Option<u64>,
+    pub working_set_bytes: Option<u64>,
+    pub peak_working_set_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1994,6 +1996,8 @@ fn observe_query(
         model_text_bytes: measurement.text_bytes,
         mcp_result_bytes: measurement.result_bytes,
         wire_bytes: measurement.wire_bytes,
+        working_set_bytes: measurement.working_set_bytes,
+        peak_working_set_bytes: measurement.peak_working_set_bytes,
         reported_used_tokens: measurement
             .payload
             .get("used_tokens")

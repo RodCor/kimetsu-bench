@@ -32,6 +32,23 @@ def report(rows):
 
 
 class PairedComparisonTests(unittest.TestCase):
+    def test_memory_summary_reports_unavailable_and_observed_peak_separately(self):
+        base = report([("a", "retrieval", 1)])
+        base["scenarios"][0]["observations"] = [
+            dict(query="a", positive_recall_at_4=1, positive_hit_at_4=True,
+                 positive_mrr=1, negative_injection=None, stale_injection=None,
+                 latency_ms=1, first_query=True, model_text_bytes=80, mcp_result_bytes=100,
+                 working_set_bytes=1000, peak_working_set_bytes=2000),
+        ]
+        summary = compare_reports([base], [base])["measurement_summary"]["baseline"]
+        self.assertEqual(summary["max_mcp_peak_working_set_bytes"], 2000)
+        self.assertEqual(summary["memory_observations"], 1)
+        base["scenarios"][0]["observations"][0]["working_set_bytes"] = None
+        base["scenarios"][0]["observations"][0]["peak_working_set_bytes"] = None
+        summary = compare_reports([base], [base])["measurement_summary"]["baseline"]
+        self.assertIsNone(summary["max_mcp_peak_working_set_bytes"])
+        self.assertEqual(summary["memory_observations"], 0)
+
     def test_side_thread_overrides_preserve_base_and_allow_unset(self):
         base = {"KIMETSU_USER_BRAIN":"0", "KIMETSU_INTRA_THREADS":"8"}
         self.assertNotIn("KIMETSU_INTRA_THREADS", compare_brainbench.environment_for_side(base, 0))

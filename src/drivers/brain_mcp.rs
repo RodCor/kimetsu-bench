@@ -46,6 +46,40 @@ pub(super) struct McpMeasurement {
     pub latency_ms: f64,
     pub first_query: bool,
     pub server_startup_ms: f64,
+    pub working_set_bytes: Option<u64>,
+    pub peak_working_set_bytes: Option<u64>,
+}
+
+#[cfg(windows)]
+fn process_memory(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // The caller retains the live process handle. The initialized C-layout
+    // output buffer and cb match the Windows API's required structure size.
+    if unsafe { K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) } == 0 {
+        None
+    } else {
+        Some((
+            counters.WorkingSetSize as u64,
+            counters.PeakWorkingSetSize as u64,
+        ))
+    }
+}
+
+fn child_memory(child: &Child) -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        process_memory(child.as_raw_handle())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+        None // Unavailable is not zero; platform-specific collectors can extend this.
+    }
 }
 
 pub(super) struct BrainMcp {
@@ -147,6 +181,8 @@ impl BrainMcp {
         let (payload, text_bytes, result_bytes) = decode_tool_result(&response, id)?;
         let first_query = self.queries == 0;
         self.queries += 1;
+        // Sample only the MCP child, after stopping the request latency clock.
+        let memory = child_memory(&self.child);
         Ok(McpMeasurement {
             payload,
             text_bytes,
@@ -155,6 +191,8 @@ impl BrainMcp {
             latency_ms,
             first_query,
             server_startup_ms: if first_query { self.startup_ms } else { 0.0 },
+            working_set_bytes: memory.map(|m| m.0),
+            peak_working_set_bytes: memory.map(|m| m.1),
         })
     }
 }
@@ -170,6 +208,15 @@ impl Drop for BrainMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_memory_reports_live_working_set_and_peak() {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let (current, peak) = process_memory(unsafe { GetCurrentProcess() }).unwrap();
+        assert!(current > 0);
+        assert!(peak >= current);
+    }
 
     #[test]
     fn measures_serialized_result_and_utf8_text_without_losing_escapes() {

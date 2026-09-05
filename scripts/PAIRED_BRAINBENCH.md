@@ -25,6 +25,8 @@ Query observations retain hit@4, fraction recall@4, MRR, negative injection and 
 
 Response sizes include UTF-8 model text, the serialized MCP result, and the full JSON-RPC response line. `reported_used_tokens` is retained as a diagnostic: old heuristic estimates and new conservative byte bounds are not directly comparable. These byte measurements are not provider tokenizer counts or billed-token measurements.
 
+On Windows, each query also samples the MCP child's current and lifetime peak working set via `GetProcessMemoryInfo`, after the latency clock stops. The comparison reports the largest observed process peak; it excludes `kbench`, separate ingestion processes, other agents and system-wide model caches. A working set includes resident shared pages, so it is not private allocation or a sum of whole-agent RAM. Unsupported platforms or failed samples report unavailable. [Windows counter definitions](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters).
+
 For runtime experiments use `--baseline-threads 0 --candidate-threads 4` with the same binary on both sides (`0` removes `KIMETSU_INTRA_THREADS`; omission inherits it). `KBENCH_RERANKER` sets `embedder.reranker` only inside temporary benchmark projects and is recorded; the binary must actually honor that setting on MCP for a model comparison to be valid. Keep other settings fixed and avoid concurrent builds or other inference during timing runs.
 
 The small checked-in fixture is a regression and exploratory language track, not a comprehensive held-out benchmark. It includes temporal validity fields and persistent-process write visibility. Final host token consumption and complete-agent success require the corresponding serving and agent evaluations.
