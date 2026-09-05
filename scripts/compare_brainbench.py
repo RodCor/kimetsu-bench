@@ -309,7 +309,7 @@ def main():
                   binaries={k: fingerprint(v) for k,v in binaries.items()},
                   datasets=dataset_fingerprints(args.dataset),
                   settings=dict(budget_tokens=args.budget_tokens, dimensions=sorted(dimensions),
-                                jobs=1, overrides=overrides,
+                                jobs=1, warm_start=False, include_ambient=False, overrides=overrides,
                                 baseline_threads=args.baseline_threads, candidate_threads=args.candidate_threads,
                                 baseline_reranker=args.baseline_reranker, candidate_reranker=args.candidate_reranker), runs=[])
     reports = {"baseline": [], "candidate": []}

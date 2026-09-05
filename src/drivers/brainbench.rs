@@ -671,6 +671,9 @@ pub struct BrainBenchReport {
     pub generated_at: String,
     /// Path to the dataset file.
     pub dataset: String,
+    /// Controlled setup used by this harness; absent on historical reports.
+    #[serde(default)]
+    pub session_configuration: Option<serde_json::Value>,
     /// Per-scenario results (full detail).
     pub scenarios: Vec<ScenarioResult>,
     /// "dimension/tier" -> (sum_of_scores, count). Skipped scenarios excluded.
@@ -1843,13 +1846,14 @@ fn resolve_kimetsu_bin(cfg: &BrainBenchConfig) -> String {
 ///
 /// EVERY kimetsu call sets `KIMETSU_USER_BRAIN=0` so the global cross-project
 /// brain cannot leak pre-existing memories into measurements.
-fn reranker_config_overrides(reranker: &str) -> Vec<(&str, &str)> {
+fn brain_config_overrides(reranker: Option<&str>) -> Vec<(&str, &str)> {
     // New projects select the deep preset, which overwrites concrete models
     // during configuration loading. Leave preset mode before selecting one.
-    vec![
-        ("retrieval.level", "custom"),
-        ("embedder.reranker", reranker),
-    ]
+    let mut settings = vec![("broker.warm_start", "false")];
+    if let Some(model) = reranker {
+        settings.extend([("retrieval.level", "custom"), ("embedder.reranker", model)]);
+    }
+    settings
 }
 
 fn setup_brain(kimetsu_bin: &str) -> Result<tempfile::TempDir, BrainBenchError> {
@@ -1886,20 +1890,19 @@ fn setup_brain(kimetsu_bin: &str) -> Result<tempfile::TempDir, BrainBenchError> 
         )));
     }
 
-    if let Ok(reranker) = std::env::var("KBENCH_RERANKER") {
-        for (key, value) in reranker_config_overrides(&reranker) {
-            let configured = Command::new(kimetsu_bin)
-                .current_dir(workspace)
-                .env("KIMETSU_USER_BRAIN", "0")
-                .args(["config", "set", key, value])
-                .output()
-                .map_err(|e| BrainBenchError::KimetsuError(format!("set {key}: {e}")))?;
-            if !configured.status.success() {
-                return Err(BrainBenchError::KimetsuError(format!(
-                    "set {key} failed: {}",
-                    String::from_utf8_lossy(&configured.stderr)
-                )));
-            }
+    let reranker = std::env::var("KBENCH_RERANKER").ok();
+    for (key, value) in brain_config_overrides(reranker.as_deref()) {
+        let configured = Command::new(kimetsu_bin)
+            .current_dir(workspace)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .args(["config", "set", key, value])
+            .output()
+            .map_err(|e| BrainBenchError::KimetsuError(format!("set {key}: {e}")))?;
+        if !configured.status.success() {
+            return Err(BrainBenchError::KimetsuError(format!(
+                "set {key} failed: {}",
+                String::from_utf8_lossy(&configured.stderr)
+            )));
         }
     }
 
@@ -3786,6 +3789,9 @@ fn build_report(results: Vec<ScenarioResult>, dataset_path: &Path) -> BrainBench
     BrainBenchReport {
         generated_at: now,
         dataset: dataset_path.to_string_lossy().to_string(),
+        session_configuration: Some(
+            serde_json::json!({"warm_start":false,"include_ambient":false}),
+        ),
         scenarios: results,
         by_dimension_tier,
         by_dimension,
@@ -4002,8 +4008,9 @@ mod tests {
         for model in ["ms-marco-minilm-l-4-v2", "off"] {
             let mut config = kimetsu_core::config::ProjectConfig::default_for_project("benchmark");
             config.retrieval.level = "deep".into();
-            for (key, value) in reranker_config_overrides(model) {
+            for (key, value) in brain_config_overrides(Some(model)) {
                 match key {
+                    "broker.warm_start" => config.broker.warm_start = value.parse().unwrap(),
                     "retrieval.level" => config.retrieval.level = value.into(),
                     "embedder.reranker" => config.embedder.reranker = value.into(),
                     _ => panic!("unexpected override {key}"),
@@ -4011,6 +4018,22 @@ mod tests {
                 config.apply_retrieval_level();
             }
             assert_eq!(config.embedder.reranker, model);
+        }
+    }
+
+    #[test]
+    fn retrieval_measurements_disable_unscored_warm_start_for_every_model() {
+        for model in [None, Some("ms-marco-tinybert-l-2-v2"), Some("off")] {
+            let mut config = kimetsu_core::config::ProjectConfig::default_for_project("benchmark");
+            for (key, value) in brain_config_overrides(model) {
+                if key == "broker.warm_start" {
+                    config.broker.warm_start = value.parse().unwrap();
+                }
+            }
+            assert!(
+                !config.broker.warm_start,
+                "warm text is outside capsule gold coverage"
+            );
         }
     }
 
