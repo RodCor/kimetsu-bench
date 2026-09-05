@@ -1798,6 +1798,7 @@ dependencies = [
  "hf-hub",
  "ignore",
  "kimetsu-core",
+ "ort",
  "regex",
  "rusqlite",
  "serde",

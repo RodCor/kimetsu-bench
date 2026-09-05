@@ -16,6 +16,36 @@ def report(rows):
 
 
 class PairedComparisonTests(unittest.TestCase):
+    def test_side_thread_overrides_preserve_base_and_allow_unset(self):
+        base = {"KIMETSU_USER_BRAIN":"0", "KIMETSU_INTRA_THREADS":"8"}
+        self.assertNotIn("KIMETSU_INTRA_THREADS", compare_brainbench.environment_for_side(base, 0))
+        self.assertEqual(compare_brainbench.environment_for_side(base, 4)["KIMETSU_INTRA_THREADS"], "4")
+        self.assertEqual(compare_brainbench.environment_for_side(base, None)["KIMETSU_INTRA_THREADS"], "8")
+        self.assertEqual(base["KIMETSU_INTRA_THREADS"], "8")
+
+    def test_query_measurements_separate_recall_hit_and_first_query_latency(self):
+        base = report([("a", "retrieval", .5)])
+        base["scenarios"][0]["observations"] = [
+            dict(query="a", positive_recall_at_4=.5, positive_hit_at_4=True,
+                 positive_mrr=1, negative_injection=None, stale_injection=None,
+                 latency_ms=100, first_query=True, model_text_bytes=80, mcp_result_bytes=100),
+            dict(query="b", positive_recall_at_4=1, positive_hit_at_4=True,
+                 positive_mrr=1, negative_injection=None, stale_injection=None,
+                 latency_ms=20, first_query=False, model_text_bytes=180, mcp_result_bytes=200),
+            dict(query="negative", positive_recall_at_4=None, positive_hit_at_4=None,
+                 positive_mrr=None, negative_injection=False, stale_injection=None,
+                 latency_ms=40, first_query=False, model_text_bytes=280, mcp_result_bytes=300),
+        ]
+        summary = compare_reports([base, base], [base, base])["measurement_summary"]["baseline"]
+        self.assertEqual(summary["unique_queries"], 3)
+        self.assertEqual(summary["positive_queries"], 2)
+        self.assertEqual(summary["query_observations"], 6)
+        self.assertEqual(summary["positive_recall_at_4"], .75)
+        self.assertEqual(summary["positive_hit_at_4"], 1)
+        self.assertEqual(summary["negative_injection_rate"], 0)
+        self.assertEqual(summary["subsequent_query_p95_ms"], 40)
+        self.assertEqual(summary["mean_mcp_result_bytes"], 200)
+
     def test_repeats_are_not_independent_scenarios(self):
         base = report([("a", "retrieval", 0), ("b", "retrieval", 1)])
         candidate = report([("b", "retrieval", 1), ("a", "retrieval", 1)])

@@ -52,6 +52,59 @@ def indexed(report):
     return result
 
 
+def measurement_summary(reports, paired_keys):
+    groups = {}
+    for run in reports:
+        for scenario in run["scenarios"]:
+            identity = f"{scenario['dimension']}/{scenario['id']}"
+            if identity not in paired_keys:
+                continue
+            observations = scenario.get("observations", [])
+            if not isinstance(observations, list):
+                raise ValueError("observations must be an array")
+            for index, observation in enumerate(observations):
+                if not isinstance(observation, dict) or not isinstance(observation.get("query"), str):
+                    raise ValueError("query observation requires a query string")
+                key = (identity, index, observation["query"])
+                groups.setdefault(key, []).append(observation)
+    if not groups:
+        return None
+    metric_names = ["positive_recall_at_4", "positive_hit_at_4", "positive_mrr", "negative_injection", "stale_injection"]
+    metrics = {name: [] for name in metric_names}
+    first, subsequent, text_bytes, result_bytes = [], [], [], []
+    count = 0
+    for observations in groups.values():
+        for name in metric_names:
+            values = [o.get(name) for o in observations if o.get(name) is not None]
+            if any(not isinstance(v, (int, float, bool)) or not math.isfinite(v) or not 0 <= v <= 1 for v in values):
+                raise ValueError(f"invalid query metric {name}")
+            if values:
+                metrics[name].append(statistics.mean(values))
+        for observation in observations:
+            count += 1
+            if not isinstance(observation.get("first_query"), bool):
+                raise ValueError("query observation requires first-query classification")
+            for field in ["latency_ms", "model_text_bytes", "mcp_result_bytes"]:
+                value = observation.get(field)
+                if isinstance(value, bool) or not isinstance(value, (int,float)) or not math.isfinite(value) or value < 0:
+                    raise ValueError(f"invalid query measurement {field}")
+            (first if observation["first_query"] else subsequent).append(observation["latency_ms"])
+            text_bytes.append(observation["model_text_bytes"])
+            result_bytes.append(observation["mcp_result_bytes"])
+    avg = lambda values: statistics.mean(values) if values else None
+    def percentile(values, p):
+        return sorted(values)[max(0, math.ceil(len(values)*p)-1)] if values else None
+    return dict(unique_queries=len(groups), query_observations=count,
+                positive_queries=len(metrics["positive_recall_at_4"]), negative_queries=len(metrics["negative_injection"]),
+                positive_recall_at_4=avg(metrics["positive_recall_at_4"]),
+                positive_hit_at_4=avg(metrics["positive_hit_at_4"]), positive_mrr=avg(metrics["positive_mrr"]),
+                negative_injection_rate=avg(metrics["negative_injection"]), stale_injection_rate=avg(metrics["stale_injection"]),
+                first_query_mean_ms=avg(first), subsequent_query_p50_ms=percentile(subsequent,.5),
+                subsequent_query_p95_ms=percentile(subsequent,.95), subsequent_observations=len(subsequent),
+                mean_model_text_bytes=avg(text_bytes), mean_mcp_result_bytes=avg(result_bytes),
+                note="Quality averages repeats per query; latency percentiles pool repeated observations descriptively, not as independent evidence. First query includes model loading where applicable; server/process initialization is recorded separately.")
+
+
 def compare_reports(baseline, candidate):
     if not baseline or len(baseline) != len(candidate):
         raise ValueError("equal nonempty repeat counts are required")
@@ -96,7 +149,9 @@ def compare_reports(baseline, candidate):
             losses=sum(d < 0 for d in deltas))
     errors = lambda reports: sum(row["detail"].startswith("error:")
                                  for report in reports for row in report["scenarios"])
-    return dict(by_dimension=dimensions, scenarios=rows, unpaired_scenarios=unpaired,
+    paired_keys = {row["identity"] for row in rows}
+    measurements = {"baseline": measurement_summary(baseline, paired_keys), "candidate": measurement_summary(candidate, paired_keys)}
+    return dict(measurement_summary=measurements, by_dimension=dimensions, scenarios=rows, unpaired_scenarios=unpaired,
                 unpaired_details=unpaired_details,
                 baseline_errors=errors(baseline), candidate_errors=errors(candidate),
                 repeats=len(baseline),
@@ -144,6 +199,16 @@ def markdown(result):
     for label in ["baseline", "candidate"]:
         values = [run["wall_seconds"] for run in result["runs"] if run["label"] == label]
         lines.append(f"{label}: mean complete-run time {statistics.mean(values):.2f} s ({len(values)} repeats).")
+    if any(compare["measurement_summary"].values()):
+        lines += ["", "Query measurements through persistent MCP (subsequent queries reuse the process):", "",
+                  "| Build | Positive hit@4 | Positive recall@4 | False injection | Subsequent p50 / p95 ms | Mean MCP result bytes |",
+                  "|---|---:|---:|---:|---:|---:|"]
+        def fmt(value):
+            return "n/a" if value is None else f"{value:.3f}"
+        for label, summary in compare["measurement_summary"].items():
+            if summary is not None:
+                lines.append(f"| {label} | {fmt(summary['positive_hit_at_4'])} | {fmt(summary['positive_recall_at_4'])} | {fmt(summary['negative_injection_rate'])} | {fmt(summary['subsequent_query_p50_ms'])} / {fmt(summary['subsequent_query_p95_ms'])} | {fmt(summary['mean_mcp_result_bytes'])} |")
+        lines.append("\nMeasured bytes include JSON escaping; reported token estimates are retained per query but may use different accounting rules across builds. Query timing excludes the separately recorded MCP initialization and corpus seeding.")
     return "\n".join(lines) + "\n"
 
 
@@ -159,6 +224,15 @@ def persist_result(path, result):
     path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
 
+def environment_for_side(base, threads):
+    result = dict(base)
+    if threads == 0:
+        result.pop("KIMETSU_INTRA_THREADS", None)
+    elif threads is not None:
+        result["KIMETSU_INTRA_THREADS"] = str(threads)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["kbench", "baseline", "candidate", "dataset", "out"]:
@@ -167,24 +241,29 @@ def main():
     parser.add_argument("--budget-tokens", type=int, default=512)
     parser.add_argument("--dimensions", default="retrieval,workflow,render-contract,poisoning")
     parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--baseline-threads", type=int, help="0 unsets the override; omitted inherits environment")
+    parser.add_argument("--candidate-threads", type=int, help="0 unsets the override; omitted inherits environment")
     args = parser.parse_args()
     dimensions = set(args.dimensions.split(","))
     if not dimensions or not dimensions <= OFFLINE_DIMENSIONS:
         parser.error("only reader-free, non-generative dimensions are supported")
     if args.repeats < 1 or args.budget_tokens < 1 or args.timeout_seconds < 1:
         parser.error("repeats, budget and timeout must be positive")
+    if any(value is not None and not 0 <= value <= 1024 for value in [args.baseline_threads, args.candidate_threads]):
+        parser.error("thread overrides must be between 0 (unset) and 1024")
     binaries = {label: getattr(args, label).resolve(strict=True) for label in ["baseline", "candidate"]}
     args.out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, KIMETSU_USER_BRAIN="0")
     # Record only relevant non-secret overrides, never the full environment.
     overrides = {key: env[key] for key in ["KIMETSU_BRAIN_EMBEDDER", "KIMETSU_ABSTAIN_EVIDENCE",
                  "KIMETSU_DETECT_CONFLICTS", "KIMETSU_RESOLVE_CONFLICTS", "KIMETSU_INTRA_THREADS",
-                 "FASTEMBED_CACHE_DIR"] if key in env}
+                 "FASTEMBED_CACHE_DIR", "KBENCH_RERANKER"] if key in env}
     result = dict(schema_version=1, status="running", harness=fingerprint(args.kbench),
                   binaries={k: fingerprint(v) for k,v in binaries.items()},
                   datasets=dataset_fingerprints(args.dataset),
                   settings=dict(budget_tokens=args.budget_tokens, dimensions=sorted(dimensions),
-                                jobs=1, overrides=overrides), runs=[])
+                                jobs=1, overrides=overrides,
+                                baseline_threads=args.baseline_threads, candidate_threads=args.candidate_threads), runs=[])
     reports = {"baseline": [], "candidate": []}
     for repeat in range(args.repeats):
         for label in (["baseline", "candidate"] if repeat % 2 == 0 else ["candidate", "baseline"]):
@@ -195,8 +274,10 @@ def main():
             start = time.perf_counter()
             stem = args.out / f"{repeat+1}-{label}"
             run_record = dict(label=label, repeat=repeat+1)
+            run_env = environment_for_side(env, getattr(args, f"{label}_threads"))
+            run_record["intra_threads_override"] = run_env.get("KIMETSU_INTRA_THREADS")
             try:
-                completed = subprocess.run(cmd, env=env, capture_output=True,
+                completed = subprocess.run(cmd, env=run_env, capture_output=True,
                                            timeout=args.timeout_seconds, encoding="utf-8",
                                            errors="strict")
             except subprocess.TimeoutExpired as error:

@@ -5,6 +5,7 @@
 //! internal corpora) drop in as new files here.
 
 pub mod beam;
+mod brain_mcp;
 pub mod brainbench;
 pub mod locomo;
 pub mod longmemeval;
