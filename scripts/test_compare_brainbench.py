@@ -88,6 +88,39 @@ class RunnerFailureTests(unittest.TestCase):
         completed = subprocess.CompletedProcess([], 0, stdout="not json", stderr="warning")
         self.assert_incomplete_failure(completed, "invalid_json")
 
+    def test_valid_json_with_wrong_report_shape_is_persisted_as_failure(self):
+        for payload in ["null", "{}", '{"scenarios": [{}]}']:
+            with self.subTest(payload=payload):
+                completed = subprocess.CompletedProcess([], 0, stdout=payload, stderr="")
+                self.assert_incomplete_failure(completed, "invalid_report")
+
+    def test_changed_scenario_identity_finalizes_as_incomplete(self):
+        baseline = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(report([("a", "retrieval", 1)])), stderr="")
+        candidate = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(report([("b", "retrieval", 1)])), stderr="")
+        with mock.patch.object(sys, "argv", self.argv()), \
+             mock.patch.object(subprocess, "run", side_effect=[baseline, candidate]):
+            rc = compare_brainbench.main()
+        artifact = json.loads((self.root / "out" / "comparison.json").read_text(encoding="utf-8"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(artifact["status"], "incomplete")
+        self.assertEqual(artifact["failure"]["kind"], "comparison_validation")
+        self.assertNotIn("comparison", artifact)
+
+    def test_duplicate_scenario_identity_finalizes_as_incomplete(self):
+        duplicate = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(report([
+                ("a", "retrieval", 0), ("a", "retrieval", 1)
+            ])), stderr="")
+        with mock.patch.object(sys, "argv", self.argv()), \
+             mock.patch.object(subprocess, "run", return_value=duplicate):
+            rc = compare_brainbench.main()
+        artifact = json.loads((self.root / "out" / "comparison.json").read_text(encoding="utf-8"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(artifact["status"], "incomplete")
+        self.assertEqual(artifact["failure"]["kind"], "comparison_validation")
+
 
 if __name__ == "__main__":
     unittest.main()

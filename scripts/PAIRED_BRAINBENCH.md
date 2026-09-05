@@ -13,7 +13,7 @@ The runner alternates baseline/candidate order, fixes one scenario worker, retai
 
 Each scenario is paired by dimension and ID. Repeats are averaged within a scenario, not counted as additional independent cases. A scenario with a skipped or errored observation on either side is reported as unpaired and excluded from quality deltas; execution failures are not scores. The exploratory confidence interval bootstraps scenario IDs. Related scenarios are still correlated: a release claim requires held-out task/repository families and real task-success measurements. Changed/duplicate scenario identities are errors.
 
-`comparison.json` is written as the run progresses. A command failure, timeout, or invalid JSON response leaves it with `status: "incomplete"`, structured failure evidence, and all completed run records; the process exits nonzero and does not write a completed Markdown comparison.
+`comparison.json` is written as the run progresses. A command failure, timeout, invalid JSON/report response, or final identity-validation failure leaves it with `status: "incomplete"`, structured failure evidence, and all completed run records; the process exits nonzero and does not write a completed Markdown comparison.
 
 BrainBench's headline now weights measured dimensions equally; the old scenario-weighted average remains a diagnostic. No-answer queries score abstention, not the vacuous recall of an empty relevant set. Positive recall and negative injection rates use separate denominators, and stale correctness is reported as unavailable when no stale cases exist. Unmatched or ambiguous returned capsules retain their rank and count as injected material.
 

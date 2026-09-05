@@ -20,15 +20,34 @@ OFFLINE_DIMENSIONS = {
     "poisoning", "render-contract", "graph", "workflow",
 }
 
+REPORT_ROW_FIELDS = {"id", "dimension", "score", "skipped", "detail"}
+
+
+def validate_report(report):
+    if not isinstance(report, dict) or not isinstance(report.get("scenarios"), list):
+        raise ValueError("report must be an object with a scenarios array")
+    for index, row in enumerate(report["scenarios"]):
+        if not isinstance(row, dict):
+            raise ValueError(f"scenario {index} must be an object")
+        missing = REPORT_ROW_FIELDS - set(row)
+        if missing:
+            raise ValueError(f"scenario {index} lacks fields: {', '.join(sorted(missing))}")
+        if not isinstance(row["id"], str) or not isinstance(row["dimension"], str):
+            raise ValueError(f"scenario {index} identity must contain strings")
+        if (isinstance(row["score"], bool) or not isinstance(row["score"], (int, float))
+                or not math.isfinite(row["score"]) or not 0 <= row["score"] <= 1):
+            raise ValueError(f"scenario {index} has an invalid score")
+        if not isinstance(row["skipped"], bool) or not isinstance(row["detail"], str):
+            raise ValueError(f"scenario {index} has invalid status fields")
+
 
 def indexed(report):
+    validate_report(report)
     result = {}
     for row in report["scenarios"]:
         key = f"{row['dimension']}/{row['id']}"
         if key in result:
             raise ValueError(f"duplicate scenario identity: {key}")
-        if not math.isfinite(row["score"]) or not 0 <= row["score"] <= 1:
-            raise ValueError(f"invalid score: {key}")
         result[key] = row
     return result
 
@@ -210,12 +229,27 @@ def main():
                 result["status"] = "incomplete"
                 persist_result(args.out / "comparison.json", result)
                 return 1
-            stem.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            report_path = stem.with_suffix(".json")
+            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            run_record["report_file"] = report_path.name
+            try:
+                validate_report(report)
+            except ValueError as error:
+                run_record["failure"] = dict(kind="invalid_report", message=str(error))
+                result["runs"].append(run_record)
+                result["status"] = "incomplete"
+                persist_result(args.out / "comparison.json", result)
+                return 1
             reports[label].append(report)
-            run_record["report_file"] = stem.with_suffix(".json").name
             result["runs"].append(run_record)
             persist_result(args.out / "comparison.json", result)
-    result["comparison"] = compare_reports(reports["baseline"], reports["candidate"])
+    try:
+        result["comparison"] = compare_reports(reports["baseline"], reports["candidate"])
+    except ValueError as error:
+        result["status"] = "incomplete"
+        result["failure"] = dict(kind="comparison_validation", message=str(error))
+        persist_result(args.out / "comparison.json", result)
+        return 1
     result["status"] = "complete"
     persist_result(args.out / "comparison.json", result)
     (args.out / "comparison.md").write_text(markdown(result), encoding="utf-8")
