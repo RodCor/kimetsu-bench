@@ -59,6 +59,10 @@ REPORT_ROW_FIELDS = {"id", "dimension", "score", "skipped", "detail"}
 def validate_report(report):
     if not isinstance(report, dict) or not isinstance(report.get("scenarios"), list):
         raise ValueError("report must be an object with a scenarios array")
+    configuration = report.get("session_configuration")
+    if (not isinstance(configuration, dict) or configuration.get("warm_start") is not False
+            or configuration.get("include_ambient") is not False):
+        raise ValueError("session_configuration must confirm warm_start=false and include_ambient=false")
     for index, row in enumerate(report["scenarios"]):
         if not isinstance(row, dict):
             raise ValueError(f"scenario {index} must be an object")

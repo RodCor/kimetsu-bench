@@ -27,11 +27,19 @@ class ProcessOwnershipTests(unittest.TestCase):
 
 
 def report(rows):
-    return {"scenarios": [dict(id=key, dimension=dim, score=value,
+    return {"session_configuration":{"warm_start":False,"include_ambient":False}, "scenarios": [dict(id=key, dimension=dim, score=value,
                                skipped=False, detail="ok") for key, dim, value in rows]}
 
 
 class PairedComparisonTests(unittest.TestCase):
+    def test_pairing_rejects_missing_or_false_isolation_provenance(self):
+        for configuration in [None, {}, {"warm_start":True,"include_ambient":False},
+                              {"warm_start":0,"include_ambient":False}]:
+            sample = report([("a", "retrieval", 1)])
+            sample["session_configuration"] = configuration
+            with self.assertRaisesRegex(ValueError, "session_configuration"):
+                compare_reports([sample], [report([("a", "retrieval", 1)])])
+
     def test_memory_summary_reports_unavailable_and_observed_peak_separately(self):
         base = report([("a", "retrieval", 1)])
         base["scenarios"][0]["observations"] = [
