@@ -623,6 +623,9 @@ pub struct RenderContractSpec {
 pub struct QueryObservation {
     pub query: String,
     pub ranked: Vec<String>,
+    /// Delivered evidence, retained for auditing text matching and compression.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_capsules: Vec<serde_json::Value>,
     pub positive_recall_at_4: Option<f64>,
     pub positive_hit_at_4: Option<bool>,
     pub positive_mrr: Option<f64>,
@@ -2034,6 +2037,12 @@ fn observe_query(
     QueryObservation {
         query: query.into(),
         ranked: ranked.to_vec(),
+        delivered_capsules: measurement
+            .payload
+            .get("capsules")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
         positive_recall_at_4: positive.then(|| recall_at_k(ranked, relevant, 4)),
         positive_hit_at_4: positive.then(|| ranked.iter().take(4).any(|id| relevant.contains(id))),
         positive_mrr: positive.then(|| mrr(ranked, relevant)),
@@ -2079,6 +2088,21 @@ fn ranked_fixture_keys(
                 ))
             })?;
             let body = normalize(strip_prefix_summary(summary));
+            // Chronological rendering adds a date before the visible memory.
+            // Compression may remove its tail, making neither whole string a
+            // substring of the other. Ignore only this known date decoration.
+            let dated_body = body.strip_prefix('[').and_then(|rest| {
+                let (date, text) = rest.split_once("] ")?;
+                let bytes = date.as_bytes();
+                (bytes.len() == 10
+                    && bytes[4] == b'-'
+                    && bytes[7] == b'-'
+                    && bytes
+                        .iter()
+                        .enumerate()
+                        .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit()))
+                .then_some(text)
+            });
             // Match the capsule body against fixture memory texts. Prefer exact
             // normalized equality; fall back to substring containment either way
             // (the summary may truncate or lightly reword the stored text).
@@ -2092,7 +2116,12 @@ fn ranked_fixture_keys(
                     .filter(|(norm, _)| {
                         !body.is_empty()
                             && !norm.is_empty()
-                            && (body.contains(norm.as_str()) || norm.contains(&body))
+                            && (body.contains(norm.as_str())
+                                || norm.contains(&body)
+                                || dated_body.is_some_and(|text| {
+                                    !text.is_empty()
+                                        && (text.contains(norm.as_str()) || norm.contains(text))
+                                }))
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -4747,6 +4776,21 @@ mod tests {
         assert_eq!(
             retrieval_score(&s(&["current"]), &s(&["current"]), &s(&["expired"])),
             1.0
+        );
+    }
+
+    #[test]
+    fn dated_compressed_capsule_matches_visible_fixture_text() {
+        let memories = vec![Memory { key: "gold".into(), text: "Use stdout for protocol. Send diagnostics to stderr. Keep logs separate. Extra explanation.".into(), scope: "project".into(), kind: "fact".into(), valid_from: None, valid_to: None }];
+        let payload = serde_json::json!({"capsules":[{"summary":"project:fact - [2026-09-07] Use stdout for protocol. Send diagnostics to stderr. Keep logs separate."}]});
+        assert_eq!(
+            ranked_fixture_keys(&payload, &memories).unwrap(),
+            vec!["gold"]
+        );
+        let unrelated = serde_json::json!({"capsules":[{"summary":"project:fact - [2026-09-07] Use a different database."}]});
+        assert_ne!(
+            ranked_fixture_keys(&unrelated, &memories).unwrap(),
+            vec!["gold"]
         );
     }
 
