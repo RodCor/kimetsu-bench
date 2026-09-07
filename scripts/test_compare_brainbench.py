@@ -70,6 +70,14 @@ class PairedComparisonTests(unittest.TestCase):
         self.assertEqual(compare_brainbench.environment_for_side(base, 4, "ms-marco-minilm-l-4-v2")["KBENCH_RERANKER"], "ms-marco-minilm-l-4-v2")
         self.assertEqual(compare_brainbench.environment_for_side(base, None)["KBENCH_RERANKER"], base["KBENCH_RERANKER"])
 
+    def test_side_cutoff_isolated_and_validated(self):
+        base = {"KBENCH_RERANK_FLOOR": "0.3"}
+        self.assertEqual(compare_brainbench.environment_for_side(base, None, None, .9)["KBENCH_RERANK_FLOOR"], "0.9")
+        self.assertEqual(base["KBENCH_RERANK_FLOOR"], "0.3")
+        for invalid in [-.1, 1.1, float("nan"), float("inf")]:
+            with self.assertRaises(ValueError):
+                compare_brainbench.environment_for_side(base, None, None, invalid)
+
     def test_query_measurements_separate_recall_hit_and_first_query_latency(self):
         base = report([("a", "retrieval", .5)])
         base["scenarios"][0]["observations"] = [

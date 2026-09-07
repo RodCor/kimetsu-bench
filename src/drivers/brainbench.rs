@@ -1891,7 +1891,20 @@ fn setup_brain(kimetsu_bin: &str) -> Result<tempfile::TempDir, BrainBenchError> 
     }
 
     let reranker = std::env::var("KBENCH_RERANKER").ok();
-    for (key, value) in brain_config_overrides(reranker.as_deref()) {
+    let floor = std::env::var("KBENCH_RERANK_FLOOR").ok();
+    let mut settings = brain_config_overrides(reranker.as_deref());
+    if let Some(value) = floor.as_deref() {
+        let parsed = value
+            .parse::<f32>()
+            .map_err(|_| BrainBenchError::Other("invalid KBENCH_RERANK_FLOOR".into()))?;
+        if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+            return Err(BrainBenchError::Other(
+                "KBENCH_RERANK_FLOOR must be finite and between 0 and 1".into(),
+            ));
+        }
+        settings.push(("broker.rerank_min_score", value));
+    }
+    for (key, value) in settings {
         let configured = Command::new(kimetsu_bin)
             .current_dir(workspace)
             .env("KIMETSU_USER_BRAIN", "0")
@@ -1906,6 +1919,29 @@ fn setup_brain(kimetsu_bin: &str) -> Result<tempfile::TempDir, BrainBenchError> 
         }
     }
 
+    if let Some(expected) = floor.as_deref() {
+        // Older binaries accept unknown TOML keys but omit them from effective
+        // config. Never label that silent no-op as a measured threshold.
+        let actual = Command::new(kimetsu_bin)
+            .current_dir(workspace)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .args(["config", "get", "broker.rerank_min_score"])
+            .output()
+            .map_err(|e| {
+                BrainBenchError::KimetsuError(format!("read effective rerank floor: {e}"))
+            })?;
+        let parsed = String::from_utf8_lossy(&actual.stdout)
+            .trim()
+            .parse::<f32>()
+            .ok();
+        if !actual.status.success() || parsed != expected.parse::<f32>().ok() {
+            return Err(BrainBenchError::KimetsuError(format!(
+                "binary did not apply broker.rerank_min_score={expected}: {} {}",
+                String::from_utf8_lossy(&actual.stdout),
+                String::from_utf8_lossy(&actual.stderr)
+            )));
+        }
+    }
     Ok(tmp)
 }
 

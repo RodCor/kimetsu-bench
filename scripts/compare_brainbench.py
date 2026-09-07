@@ -272,7 +272,7 @@ def persist_result(path, result):
     path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
 
-def environment_for_side(base, threads, reranker=None):
+def environment_for_side(base, threads, reranker=None, rerank_floor=None):
     result = dict(base)
     if threads == 0:
         result.pop("KIMETSU_INTRA_THREADS", None)
@@ -280,6 +280,10 @@ def environment_for_side(base, threads, reranker=None):
         result["KIMETSU_INTRA_THREADS"] = str(threads)
     if reranker is not None:
         result["KBENCH_RERANKER"] = reranker
+    if rerank_floor is not None:
+        if not 0 <= rerank_floor <= 1:
+            raise ValueError("rerank floor must be finite and between 0 and 1")
+        result["KBENCH_RERANK_FLOOR"] = str(rerank_floor)
     return result
 
 
@@ -295,7 +299,11 @@ def main():
     parser.add_argument("--candidate-threads", type=int, help="0 unsets the override; omitted inherits environment")
     parser.add_argument("--baseline-reranker", help="Override reranker only in baseline temporary projects")
     parser.add_argument("--candidate-reranker", help="Override reranker only in candidate temporary projects")
+    parser.add_argument("--baseline-rerank-floor", type=float)
+    parser.add_argument("--candidate-rerank-floor", type=float)
     args = parser.parse_args()
+    if any(v is not None and not 0 <= v <= 1 for v in [args.baseline_rerank_floor, args.candidate_rerank_floor]):
+        parser.error("rerank floors must be finite and between 0 and 1")
     dimensions = set(args.dimensions.split(","))
     if not dimensions or not dimensions <= OFFLINE_DIMENSIONS:
         parser.error("only reader-free, non-generative dimensions are supported")
@@ -309,14 +317,15 @@ def main():
     # Record only relevant non-secret overrides, never the full environment.
     overrides = {key: env[key] for key in ["KIMETSU_BRAIN_EMBEDDER", "KIMETSU_ABSTAIN_EVIDENCE",
                  "KIMETSU_DETECT_CONFLICTS", "KIMETSU_RESOLVE_CONFLICTS", "KIMETSU_INTRA_THREADS",
-                 "FASTEMBED_CACHE_DIR", "KBENCH_RERANKER"] if key in env}
+                 "FASTEMBED_CACHE_DIR", "HF_HOME", "KBENCH_RERANKER", "KBENCH_RERANK_FLOOR"] if key in env}
     result = dict(schema_version=1, status="running", harness=fingerprint(args.kbench), runner=fingerprint(Path(__file__)),
                   binaries={k: fingerprint(v) for k,v in binaries.items()},
                   datasets=dataset_fingerprints(args.dataset),
                   settings=dict(budget_tokens=args.budget_tokens, dimensions=sorted(dimensions),
                                 jobs=1, warm_start=False, include_ambient=False, overrides=overrides,
                                 baseline_threads=args.baseline_threads, candidate_threads=args.candidate_threads,
-                                baseline_reranker=args.baseline_reranker, candidate_reranker=args.candidate_reranker), runs=[])
+                                baseline_reranker=args.baseline_reranker, candidate_reranker=args.candidate_reranker,
+                                baseline_rerank_floor=args.baseline_rerank_floor, candidate_rerank_floor=args.candidate_rerank_floor), runs=[])
     reports = {"baseline": [], "candidate": []}
     for repeat in range(args.repeats):
         for label in (["baseline", "candidate"] if repeat % 2 == 0 else ["candidate", "baseline"]):
@@ -327,8 +336,9 @@ def main():
             start = time.perf_counter()
             stem = args.out / f"{repeat+1}-{label}"
             run_record = dict(label=label, repeat=repeat+1)
-            run_env = environment_for_side(env, getattr(args, f"{label}_threads"), getattr(args, f"{label}_reranker"))
+            run_env = environment_for_side(env, getattr(args, f"{label}_threads"), getattr(args, f"{label}_reranker"), getattr(args, f"{label}_rerank_floor"))
             run_record["intra_threads_override"] = run_env.get("KIMETSU_INTRA_THREADS")
+            run_record["rerank_floor_override"] = run_env.get("KBENCH_RERANK_FLOOR")
             run_record["reranker_override"] = run_env.get("KBENCH_RERANKER")
             try:
                 completed = run_owned_tree(cmd, env=run_env, timeout=args.timeout_seconds)
