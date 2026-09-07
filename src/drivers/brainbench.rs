@@ -626,6 +626,9 @@ pub struct QueryObservation {
     /// Delivered evidence, retained for auditing text matching and compression.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delivered_capsules: Vec<serde_json::Value>,
+    /// Final evidence accounting as actually delivered, absent on older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answerability: Option<serde_json::Value>,
     pub positive_recall_at_4: Option<f64>,
     pub positive_hit_at_4: Option<bool>,
     pub positive_mrr: Option<f64>,
@@ -2061,6 +2064,7 @@ fn observe_query(
     QueryObservation {
         query: query.into(),
         ranked: ranked.to_vec(),
+        answerability: measurement.payload.get("answerability").cloned(),
         delivered_capsules: measurement
             .payload
             .get("capsules")
@@ -4818,6 +4822,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn query_observation_retains_delivered_answerability() {
+        let measurement = super::super::brain_mcp::McpMeasurement {
+            payload: serde_json::json!({"answerability":{"status":"partial","missing":["timeout"]}}),
+            text_bytes: 0,
+            result_bytes: 0,
+            wire_bytes: 0,
+            latency_ms: 1.0,
+            first_query: false,
+            server_startup_ms: 0.0,
+            working_set_bytes: None,
+            peak_working_set_bytes: None,
+        };
+        let observation = observe_query("q", &[], &[], &[], &measurement);
+        assert_eq!(
+            serde_json::to_value(observation).unwrap()["answerability"]["missing"],
+            serde_json::json!(["timeout"])
+        );
+    }
     #[test]
     fn unknown_capsules_keep_their_rank_and_count_as_injection() {
         let memories = vec![Memory {
