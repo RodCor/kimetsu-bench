@@ -32,6 +32,13 @@ def report(rows):
 
 
 class PairedComparisonTests(unittest.TestCase):
+    def test_guard_override_is_explicit_and_isolated(self):
+        base = {"KBENCH_EXPLICIT_FACT_GUARD": "true"}
+        self.assertEqual(compare_brainbench.environment_for_side(base, None, explicit_fact_guard="false")["KBENCH_EXPLICIT_FACT_GUARD"], "false")
+        self.assertEqual(base["KBENCH_EXPLICIT_FACT_GUARD"], "true")
+        with self.assertRaises(ValueError):
+            compare_brainbench.environment_for_side(base, None, explicit_fact_guard="maybe")
+
     def test_pairing_rejects_missing_or_false_isolation_provenance(self):
         for configuration in [None, {}, {"warm_start":True,"include_ambient":False},
                               {"warm_start":0,"include_ambient":False}]:

@@ -1895,7 +1895,16 @@ fn setup_brain(kimetsu_bin: &str) -> Result<tempfile::TempDir, BrainBenchError> 
 
     let reranker = std::env::var("KBENCH_RERANKER").ok();
     let floor = std::env::var("KBENCH_RERANK_FLOOR").ok();
+    let guard = std::env::var("KBENCH_EXPLICIT_FACT_GUARD").ok();
     let mut settings = brain_config_overrides(reranker.as_deref());
+    if let Some(value) = guard.as_deref() {
+        if !matches!(value, "true" | "false") {
+            return Err(BrainBenchError::Other(
+                "KBENCH_EXPLICIT_FACT_GUARD must be true or false".into(),
+            ));
+        }
+        settings.push(("broker.explicit_fact_guard", value));
+    }
     if let Some(value) = floor.as_deref() {
         let parsed = value
             .parse::<f32>()
@@ -1922,6 +1931,21 @@ fn setup_brain(kimetsu_bin: &str) -> Result<tempfile::TempDir, BrainBenchError> 
         }
     }
 
+    if let Some(expected) = guard.as_deref() {
+        let actual = Command::new(kimetsu_bin)
+            .current_dir(workspace)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .args(["config", "get", "broker.explicit_fact_guard"])
+            .output()
+            .map_err(|e| {
+                BrainBenchError::KimetsuError(format!("read effective fact guard: {e}"))
+            })?;
+        if !actual.status.success() || String::from_utf8_lossy(&actual.stdout).trim() != expected {
+            return Err(BrainBenchError::KimetsuError(format!(
+                "binary did not apply broker.explicit_fact_guard={expected}"
+            )));
+        }
+    }
     if let Some(expected) = floor.as_deref() {
         // Older binaries accept unknown TOML keys but omit them from effective
         // config. Never label that silent no-op as a measured threshold.
