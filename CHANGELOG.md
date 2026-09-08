@@ -8,6 +8,10 @@ changelog, see the public [kimetsu CHANGELOG](../CHANGELOG.md).
 
 ### Unreleased — paired production MCP evidence
 
+- Refresh the lockfile for Kimetsu 2.8.0 and patch the `h2`, `quinn-proto`,
+  `anyhow`, and `cxx` security advisories; replace yanked `der` 0.8.0 with
+  0.8.2. A fresh RustSec audit reports zero known vulnerabilities, with only
+  the existing informational `paste` maintenance notice remaining.
 - Persistent MCP query measurements, delivered capsule text and optional final
   answerability; scoped Windows working-set and peak memory observations.
 - Explicit per-side reranker, cutoff, threads and fact-guard settings with
