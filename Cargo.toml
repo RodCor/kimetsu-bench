@@ -62,3 +62,6 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 
 # Used by the LongMemEval driver for per-instance temp brain workspaces.
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

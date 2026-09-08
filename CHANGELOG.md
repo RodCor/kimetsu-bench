@@ -6,6 +6,17 @@ changelog, see the public [kimetsu CHANGELOG](../CHANGELOG.md).
 
 ## Bench tool
 
+### Unreleased — paired production MCP evidence
+
+- Persistent MCP query measurements, delivered capsule text and optional final
+  answerability; scoped Windows working-set and peak memory observations.
+- Explicit per-side reranker, cutoff, threads and fact-guard settings with
+  effective configuration checks and binary/fixture/runner fingerprints.
+- Separate positive and negative denominators, auditable failures, stale-query
+  accounting, dated compressed-capsule matching and timeout descendant cleanup.
+- Rust harness validation: 132 tests passed; paired-runner validation: 18 Python
+  tests passed. The linked Kimetsu audit evaluates metadata on every repeat.
+
 ### v0.5 — 2026-06-05 — `kstress` brain stress test
 
 New second binary `kstress` profiles the brain (not agent tasks) at scale —

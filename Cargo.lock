@@ -1787,6 +1787,7 @@ dependencies = [
  "tempfile",
  "time",
  "ureq 2.12.1",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1798,6 +1799,7 @@ dependencies = [
  "hf-hub",
  "ignore",
  "kimetsu-core",
+ "ort",
  "regex",
  "rusqlite",
  "serde",

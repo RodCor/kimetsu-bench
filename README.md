@@ -13,6 +13,21 @@ taking ours on faith.
 
 ## What it measures
 
+### Paired memory evidence (unreleased)
+
+BrainBenchmark now measures persistent production MCP context delivery, retaining
+rankings, delivered capsules, optional `answerability`, latency, serialized byte
+cost and supported Windows process-memory measurements. The paired runner verifies
+effective per-side model, floor and guard settings, alternates repeat order, and
+records binary/fixture fingerprints. Errors and unpaired cases are not successful
+quality observations. Historical binaries without answerability remain supported.
+
+See the public [structured-fact report](https://github.com/RodCor/kimetsu/blob/281c6df/docs/audits/2026-09-07-structured-facts.md)
+for the frozen fixture, commands and all-repeat metadata scoring. It reports
+evidence delivery rather than generated-answer accuracy; it does not replace
+older overall BrainBench scores. This branch requires the companion Kimetsu
+hardening changes in its parent checkout for the path dependencies.
+
 `kbench` runs one or more Terminal-Bench tasks under multiple agent
 configurations and produces a side-by-side comparison:
 

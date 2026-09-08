@@ -191,6 +191,10 @@ pub struct Memory {
     pub scope: String,
     #[serde(default = "default_kind")]
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
 }
 
 /// A retrieval/importance probe against an ingested scenario.
@@ -447,11 +451,15 @@ pub struct EvalFixtureFile {
     pub cases: Vec<EvalFixCase>,
 }
 
-/// One memory in an EvalFixture file. Extra fields (e.g. `valid_to`) are ignored.
+/// One memory in an EvalFixture file. Temporal applicability is retained at ingest.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EvalFixMemory {
     pub key: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
 }
 
 /// One gold-labeled retrieval case in an EvalFixture file.
@@ -609,8 +617,38 @@ pub struct RenderContractSpec {
     pub must_not_contain: Vec<String>,
 }
 
+/// One query through the production MCP surface. The first query may load the
+/// model; subsequent queries reuse the server. OS/model disk cache is not reset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryObservation {
+    pub query: String,
+    pub ranked: Vec<String>,
+    /// Delivered evidence, retained for auditing text matching and compression.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_capsules: Vec<serde_json::Value>,
+    /// Final evidence accounting as actually delivered, absent on older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answerability: Option<serde_json::Value>,
+    pub positive_recall_at_4: Option<f64>,
+    pub positive_hit_at_4: Option<bool>,
+    pub positive_mrr: Option<f64>,
+    pub negative_injection: Option<bool>,
+    pub stale_injection: Option<bool>,
+    pub latency_ms: f64,
+    pub first_query: bool,
+    pub server_startup_ms: f64,
+    pub model_text_bytes: usize,
+    pub mcp_result_bytes: usize,
+    pub wire_bytes: usize,
+    pub reported_used_tokens: Option<u64>,
+    pub working_set_bytes: Option<u64>,
+    pub peak_working_set_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<QueryObservation>,
     pub id: String,
     pub dimension: Dimension,
     pub tier: Tier,
@@ -639,6 +677,9 @@ pub struct BrainBenchReport {
     pub generated_at: String,
     /// Path to the dataset file.
     pub dataset: String,
+    /// Controlled setup used by this harness; absent on historical reports.
+    #[serde(default)]
+    pub session_configuration: Option<serde_json::Value>,
     /// Per-scenario results (full detail).
     pub scenarios: Vec<ScenarioResult>,
     /// "dimension/tier" -> (sum_of_scores, count). Skipped scenarios excluded.
@@ -646,8 +687,11 @@ pub struct BrainBenchReport {
     /// Per-dimension mean + n + 95% CI (skipped scenarios excluded).
     #[serde(default)]
     pub by_dimension: BTreeMap<String, DimensionStat>,
-    /// Mean score over NON-skipped scenarios (0.0–1.0).
+    /// Equal-weight mean over measured dimensions (0.0–1.0).
     pub overall_index: f64,
+    /// Historical scenario-weighted mean, retained as a diagnostic only.
+    #[serde(default)]
+    pub scenario_weighted_index: f64,
 }
 
 impl BrainBenchReport {
@@ -664,6 +708,10 @@ impl BrainBenchReport {
             self.overall_index * 100.0,
             total,
             skipped
+        ));
+        out.push_str(&format!(
+            "The headline weights measured dimensions equally. Scenario-weighted diagnostic: {:.1}%. Neither score estimates agent task success.\n\n",
+            self.scenario_weighted_index * 100.0
         ));
 
         out.push_str("## By dimension (n, 95% CI)\n\n");
@@ -869,7 +917,7 @@ pub fn score_workflow_episode(
         (None, _) => false,
     };
     let r = recall_at_k(ranked, relevant, k);
-    let resolution_ok = stale.is_empty() || resolution_correct(ranked, relevant, stale);
+    let resolution_ok = stale_hit_rate(ranked, stale, k) == 0.0;
     let score = if trap_hit || !resolution_ok { 0.0 } else { r };
     EpisodeScore {
         score,
@@ -957,6 +1005,8 @@ pub fn expand_eval_fixtures(
             .memories
             .iter()
             .map(|m| Memory {
+                valid_from: m.valid_from.clone(),
+                valid_to: m.valid_to.clone(),
                 key: m.key.clone(),
                 text: m.text.clone(),
                 scope: default_scope(),
@@ -1084,18 +1134,24 @@ pub fn expand_calibration_gen(
             ),
             memories: vec![
                 Memory {
+                    valid_from: None,
+                    valid_to: None,
                     key: "good".to_string(),
                     text: pool[gi].text.clone(),
                     scope: default_scope(),
                     kind: default_kind(),
                 },
                 Memory {
+                    valid_from: None,
+                    valid_to: None,
                     key: "neutral".to_string(),
                     text: pool[ni].text.clone(),
                     scope: default_scope(),
                     kind: default_kind(),
                 },
                 Memory {
+                    valid_from: None,
+                    valid_to: None,
                     key: "bad".to_string(),
                     text: pool[bi].text.clone(),
                     scope: default_scope(),
@@ -1166,6 +1222,11 @@ pub fn expand_workflow_gen(
         .memories
         .iter()
         .map(|m| (m.key.clone(), m.text.clone()))
+        .collect();
+    let mem_validity_by_key: std::collections::HashMap<_, _> = fixture
+        .memories
+        .iter()
+        .map(|m| (m.key.clone(), (m.valid_from.clone(), m.valid_to.clone())))
         .collect();
     let resolvable = |keys: &[String]| keys.iter().all(|k| mem_text_by_key.contains_key(k));
 
@@ -1270,6 +1331,8 @@ pub fn expand_workflow_gen(
             keys.iter()
                 .filter(|k| taken.insert((*k).clone()))
                 .map(|k| Memory {
+                    valid_from: mem_validity_by_key[k].0.clone(),
+                    valid_to: mem_validity_by_key[k].1.clone(),
                     key: k.clone(),
                     text: mem_text_by_key[k].clone(),
                     scope: default_scope(),
@@ -1723,6 +1786,8 @@ pub fn expand_workflow_gen(
                 }
                 taken.insert(m.key.clone());
                 seed.push(Memory {
+                    valid_from: m.valid_from.clone(),
+                    valid_to: m.valid_to.clone(),
                     key: m.key.clone(),
                     text: m.text.clone(),
                     scope: default_scope(),
@@ -1787,6 +1852,16 @@ fn resolve_kimetsu_bin(cfg: &BrainBenchConfig) -> String {
 ///
 /// EVERY kimetsu call sets `KIMETSU_USER_BRAIN=0` so the global cross-project
 /// brain cannot leak pre-existing memories into measurements.
+fn brain_config_overrides(reranker: Option<&str>) -> Vec<(&str, &str)> {
+    // New projects select the deep preset, which overwrites concrete models
+    // during configuration loading. Leave preset mode before selecting one.
+    let mut settings = vec![("broker.warm_start", "false")];
+    if let Some(model) = reranker {
+        settings.extend([("retrieval.level", "custom"), ("embedder.reranker", model)]);
+    }
+    settings
+}
+
 fn setup_brain(kimetsu_bin: &str) -> Result<tempfile::TempDir, BrainBenchError> {
     let tmp = tempfile::Builder::new()
         .prefix("kbench-brain-")
@@ -1821,6 +1896,82 @@ fn setup_brain(kimetsu_bin: &str) -> Result<tempfile::TempDir, BrainBenchError> 
         )));
     }
 
+    let reranker = std::env::var("KBENCH_RERANKER").ok();
+    let floor = std::env::var("KBENCH_RERANK_FLOOR").ok();
+    let guard = std::env::var("KBENCH_EXPLICIT_FACT_GUARD").ok();
+    let mut settings = brain_config_overrides(reranker.as_deref());
+    if let Some(value) = guard.as_deref() {
+        if !matches!(value, "true" | "false") {
+            return Err(BrainBenchError::Other(
+                "KBENCH_EXPLICIT_FACT_GUARD must be true or false".into(),
+            ));
+        }
+        settings.push(("broker.explicit_fact_guard", value));
+    }
+    if let Some(value) = floor.as_deref() {
+        let parsed = value
+            .parse::<f32>()
+            .map_err(|_| BrainBenchError::Other("invalid KBENCH_RERANK_FLOOR".into()))?;
+        if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+            return Err(BrainBenchError::Other(
+                "KBENCH_RERANK_FLOOR must be finite and between 0 and 1".into(),
+            ));
+        }
+        settings.push(("broker.rerank_min_score", value));
+    }
+    for (key, value) in settings {
+        let configured = Command::new(kimetsu_bin)
+            .current_dir(workspace)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .args(["config", "set", key, value])
+            .output()
+            .map_err(|e| BrainBenchError::KimetsuError(format!("set {key}: {e}")))?;
+        if !configured.status.success() {
+            return Err(BrainBenchError::KimetsuError(format!(
+                "set {key} failed: {}",
+                String::from_utf8_lossy(&configured.stderr)
+            )));
+        }
+    }
+
+    if let Some(expected) = guard.as_deref() {
+        let actual = Command::new(kimetsu_bin)
+            .current_dir(workspace)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .args(["config", "get", "broker.explicit_fact_guard"])
+            .output()
+            .map_err(|e| {
+                BrainBenchError::KimetsuError(format!("read effective fact guard: {e}"))
+            })?;
+        if !actual.status.success() || String::from_utf8_lossy(&actual.stdout).trim() != expected {
+            return Err(BrainBenchError::KimetsuError(format!(
+                "binary did not apply broker.explicit_fact_guard={expected}"
+            )));
+        }
+    }
+    if let Some(expected) = floor.as_deref() {
+        // Older binaries accept unknown TOML keys but omit them from effective
+        // config. Never label that silent no-op as a measured threshold.
+        let actual = Command::new(kimetsu_bin)
+            .current_dir(workspace)
+            .env("KIMETSU_USER_BRAIN", "0")
+            .args(["config", "get", "broker.rerank_min_score"])
+            .output()
+            .map_err(|e| {
+                BrainBenchError::KimetsuError(format!("read effective rerank floor: {e}"))
+            })?;
+        let parsed = String::from_utf8_lossy(&actual.stdout)
+            .trim()
+            .parse::<f32>()
+            .ok();
+        if !actual.status.success() || parsed != expected.parse::<f32>().ok() {
+            return Err(BrainBenchError::KimetsuError(format!(
+                "binary did not apply broker.rerank_min_score={expected}: {} {}",
+                String::from_utf8_lossy(&actual.stdout),
+                String::from_utf8_lossy(&actual.stderr)
+            )));
+        }
+    }
     Ok(tmp)
 }
 
@@ -1834,6 +1985,8 @@ fn ingest(workspace: &Path, kimetsu_bin: &str, memories: &[Memory]) -> Result<()
                 "text": m.text,
                 "scope": m.scope,
                 "kind": m.kind,
+                "valid_from": m.valid_from,
+                "valid_to": m.valid_to,
             })
             .to_string()
         })
@@ -1883,13 +2036,8 @@ fn strip_prefix_summary(summary: &str) -> &str {
     }
 }
 
-/// Retrieve the ranked fixture keys for a query.
-///
-/// Runs `brain context "<query>" --no-ambient --json --budget-tokens <N>`,
-/// parses the `capsules` array (already score-sorted), strips each capsule
-/// `summary`'s prefix, normalizes it, and matches against the normalized text of
-/// each fixture Memory to recover its `key`. Capsules that match no fixture
-/// memory are dropped. Order is preserved.
+/// A single query uses the same MCP surface as a host agent. Retrieval and
+/// workflow runners instead keep one BrainMcp alive across all their queries.
 fn retrieve_ranked_keys(
     workspace: &Path,
     kimetsu_bin: &str,
@@ -1897,39 +2045,62 @@ fn retrieve_ranked_keys(
     budget: usize,
     memories: &[Memory],
 ) -> Result<Vec<String>, BrainBenchError> {
-    let budget_str = budget.to_string();
-    let out = Command::new(kimetsu_bin)
-        .current_dir(workspace)
-        .env("KIMETSU_USER_BRAIN", "0")
-        .args([
-            "brain",
-            "context",
-            query,
-            "--no-ambient",
-            "--json",
-            "--budget-tokens",
-            &budget_str,
-        ])
-        .output()
-        .map_err(|e| {
-            BrainBenchError::KimetsuError(format!(
-                "could not spawn `{kimetsu_bin} brain context`: {e}"
-            ))
-        })?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(BrainBenchError::KimetsuError(format!(
-            "brain context failed: {stderr}"
-        )));
+    let mut client = super::brain_mcp::BrainMcp::start(workspace, kimetsu_bin)
+        .map_err(BrainBenchError::KimetsuError)?;
+    let measurement = client
+        .context(query, budget)
+        .map_err(BrainBenchError::KimetsuError)?;
+    ranked_fixture_keys(&measurement.payload, memories)
+}
+
+fn observe_query(
+    query: &str,
+    ranked: &[String],
+    relevant: &[String],
+    stale: &[String],
+    measurement: &super::brain_mcp::McpMeasurement,
+) -> QueryObservation {
+    let positive = !relevant.is_empty();
+    QueryObservation {
+        query: query.into(),
+        ranked: ranked.to_vec(),
+        answerability: measurement.payload.get("answerability").cloned(),
+        delivered_capsules: measurement
+            .payload
+            .get("capsules")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        positive_recall_at_4: positive.then(|| recall_at_k(ranked, relevant, 4)),
+        positive_hit_at_4: positive.then(|| ranked.iter().take(4).any(|id| relevant.contains(id))),
+        positive_mrr: positive.then(|| mrr(ranked, relevant)),
+        negative_injection: (!positive).then_some(!ranked.is_empty()),
+        stale_injection: (!stale.is_empty())
+            .then(|| ranked.iter().take(4).any(|id| stale.contains(id))),
+        latency_ms: measurement.latency_ms,
+        first_query: measurement.first_query,
+        server_startup_ms: measurement.server_startup_ms,
+        model_text_bytes: measurement.text_bytes,
+        mcp_result_bytes: measurement.result_bytes,
+        wire_bytes: measurement.wire_bytes,
+        working_set_bytes: measurement.working_set_bytes,
+        peak_working_set_bytes: measurement.peak_working_set_bytes,
+        reported_used_tokens: measurement
+            .payload
+            .get("used_tokens")
+            .and_then(serde_json::Value::as_u64),
     }
+}
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
-        BrainBenchError::KimetsuError(format!(
-            "brain context returned non-JSON output: {e}\n{stdout}"
-        ))
-    })?;
-
+fn ranked_fixture_keys(
+    v: &serde_json::Value,
+    memories: &[Memory],
+) -> Result<Vec<String>, BrainBenchError> {
+    if !v.get("capsules").is_some_and(serde_json::Value::is_array) {
+        return Err(BrainBenchError::KimetsuError(
+            "context response lacks a capsules array".into(),
+        ));
+    }
     // Precompute normalized fixture text -> key.
     let norm_to_key: Vec<(String, String)> = memories
         .iter()
@@ -1938,25 +2109,60 @@ fn retrieve_ranked_keys(
 
     let mut ranked: Vec<String> = Vec::new();
     if let Some(capsules) = v.get("capsules").and_then(|c| c.as_array()) {
-        for cap in capsules {
-            let summary = cap.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+        for (index, cap) in capsules.iter().enumerate() {
+            let summary = cap.get("summary").and_then(|s| s.as_str()).ok_or_else(|| {
+                BrainBenchError::KimetsuError(format!(
+                    "context response capsule {index} lacks a string summary"
+                ))
+            })?;
             let body = normalize(strip_prefix_summary(summary));
-            if body.is_empty() {
-                continue;
-            }
+            // Chronological rendering adds a date before the visible memory.
+            // Compression may remove its tail, making neither whole string a
+            // substring of the other. Ignore only this known date decoration.
+            let dated_body = body.strip_prefix('[').and_then(|rest| {
+                let (date, text) = rest.split_once("] ")?;
+                let bytes = date.as_bytes();
+                (bytes.len() == 10
+                    && bytes[4] == b'-'
+                    && bytes[7] == b'-'
+                    && bytes
+                        .iter()
+                        .enumerate()
+                        .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit()))
+                .then_some(text)
+            });
             // Match the capsule body against fixture memory texts. Prefer exact
             // normalized equality; fall back to substring containment either way
             // (the summary may truncate or lightly reword the stored text).
-            let matched = norm_to_key
+            let exact: Vec<_> = norm_to_key
                 .iter()
-                .find(|(norm, _)| *norm == body)
-                .or_else(|| {
-                    norm_to_key
-                        .iter()
-                        .find(|(norm, _)| body.contains(norm.as_str()) || norm.contains(&body))
-                });
-            if let Some((_, key)) = matched {
+                .filter(|(norm, _)| !body.is_empty() && *norm == body)
+                .collect();
+            let matches = if exact.is_empty() {
+                norm_to_key
+                    .iter()
+                    .filter(|(norm, _)| {
+                        !body.is_empty()
+                            && !norm.is_empty()
+                            && (body.contains(norm.as_str())
+                                || norm.contains(&body)
+                                || dated_body.is_some_and(|text| {
+                                    !text.is_empty()
+                                        && (text.contains(norm.as_str()) || norm.contains(text))
+                                }))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                exact
+            };
+            if let [(_, key)] = matches.as_slice() {
                 ranked.push(key.clone());
+            } else {
+                let mut unknown = format!("__unmatched_{}__", ranked.len());
+                while memories.iter().any(|m| m.key == unknown) {
+                    unknown.push('_');
+                }
+                ranked.push(unknown);
             }
         }
     }
@@ -1987,7 +2193,20 @@ fn detect_conflicts_payload(workspace: &Path, kimetsu_bin: &str) -> String {
 
 // ─── Per-dimension runners ───────────────────────────────────────────────────
 
-/// Retrieval correctness: recall@4 + MRR + resolution for knowledge-update.
+/// Current-context correctness: recall@4, with no explicitly stale capsule.
+/// Ordering stale evidence below the answer still exposes a contradictory claim.
+fn retrieval_score(ranked: &[String], relevant: &[String], stale: &[String]) -> f64 {
+    if relevant.is_empty() {
+        return if ranked.is_empty() { 1.0 } else { 0.0 };
+    }
+    let recall = recall_at_k(ranked, relevant, 4);
+    if stale_hit_rate(ranked, stale, 4) == 0.0 {
+        recall
+    } else {
+        0.0
+    }
+}
+
 fn run_retrieval(
     scenario: &Scenario,
     workspace: &Path,
@@ -2009,36 +2228,53 @@ fn run_retrieval(
     let mut mrrs: Vec<f64> = Vec::new();
     let mut stale_hits: Vec<f64> = Vec::new();
     let mut resolutions: Vec<f64> = Vec::new();
+    let mut negative_injections = Vec::new();
 
+    let mut client = super::brain_mcp::BrainMcp::start(workspace, kimetsu_bin)
+        .map_err(BrainBenchError::KimetsuError)?;
+    let mut observations = Vec::new();
     for q in &scenario.queries {
-        let ranked =
-            retrieve_ranked_keys(workspace, kimetsu_bin, &q.query, budget, &scenario.memories)?;
+        let measurement = client
+            .context(&q.query, budget)
+            .map_err(BrainBenchError::KimetsuError)?;
+        let ranked = ranked_fixture_keys(&measurement.payload, &scenario.memories)?;
+        observations.push(observe_query(
+            &q.query,
+            &ranked,
+            &q.relevant,
+            &q.stale,
+            &measurement,
+        ));
         let r4 = recall_at_k(&ranked, &q.relevant, 4);
         let m = mrr(&ranked, &q.relevant);
         let sh = stale_hit_rate(&ranked, &q.stale, 4);
         let res = resolution_correct(&ranked, &q.relevant, &q.stale);
-        recalls.push(r4);
-        mrrs.push(m);
-        stale_hits.push(sh);
-        resolutions.push(if res { 1.0 } else { 0.0 });
-
-        // Per-query blended score: recall@4, gated by resolution when the query
-        // plants a stale memory (a "current value" must outrank the old one).
-        let blended = if q.stale.is_empty() {
-            r4
+        if q.relevant.is_empty() {
+            negative_injections.push(if ranked.is_empty() { 0.0 } else { 1.0 });
         } else {
-            r4 * if res { 1.0 } else { 0.0 }
-        };
+            recalls.push(r4);
+            mrrs.push(m);
+        }
+        if !q.stale.is_empty() {
+            stale_hits.push(sh);
+            resolutions.push(if res { 1.0 } else { 0.0 });
+        }
+
+        // Explicitly stale claims must be absent from delivered current context.
+        let blended = retrieval_score(&ranked, &q.relevant, &q.stale);
         per_query_scores.push(blended);
     }
 
     let score = mean(&per_query_scores);
     let detail = format!(
-        "recall@4={:.2} mrr={:.2} stale-hit={:.2} resolution={:.2} ({} quer{})",
+        "positive-recall@4={:.2} mrr={:.2} stale-hit={} resolution={} false-injection={} positive-n={} negative-n={} ({} quer{})",
         mean(&recalls),
         mean(&mrrs),
-        mean(&stale_hits),
-        mean(&resolutions),
+        optional_metric(&stale_hits),
+        optional_metric(&resolutions),
+        optional_metric(&negative_injections),
+        recalls.len(),
+        negative_injections.len(),
         scenario.queries.len(),
         if scenario.queries.len() == 1 {
             "y"
@@ -2046,7 +2282,17 @@ fn run_retrieval(
             "ies"
         }
     );
-    Ok(skeleton_result(scenario, score, detail))
+    let mut result = skeleton_result(scenario, score, detail);
+    result.observations = observations;
+    Ok(result)
+}
+
+fn optional_metric(values: &[f64]) -> String {
+    if values.is_empty() {
+        "n/a".into()
+    } else {
+        format!("{:.3} (n={})", mean(values), values.len())
+    }
 }
 
 /// Workflow stream: one persistent brain, ordered episodes; per episode the
@@ -2094,8 +2340,21 @@ fn run_workflow(
     let mut forbidden_eps = 0usize;
     let mut trap_hits = 0usize;
 
+    let mut client = super::brain_mcp::BrainMcp::start(workspace, kimetsu_bin)
+        .map_err(BrainBenchError::KimetsuError)?;
+    let mut observations = Vec::new();
     for (ep_idx, ep) in spec.episodes.iter().enumerate() {
-        let ranked = retrieve_ranked_keys(workspace, kimetsu_bin, &ep.task, budget, &known)?;
+        let measurement = client
+            .context(&ep.task, budget)
+            .map_err(BrainBenchError::KimetsuError)?;
+        let ranked = ranked_fixture_keys(&measurement.payload, &known)?;
+        observations.push(observe_query(
+            &ep.task,
+            &ranked,
+            &ep.relevant,
+            &ep.stale,
+            &measurement,
+        ));
         let es = score_workflow_episode(&ranked, &ep.relevant, &ep.stale, &ep.forbidden, ep.top_k);
         episode_scores.push(es.score);
 
@@ -2184,7 +2443,9 @@ fn run_workflow(
         abstentions,
         known.len()
     );
-    Ok(skeleton_result(scenario, score, detail))
+    let mut result = skeleton_result(scenario, score, detail);
+    result.observations = observations;
+    Ok(result)
 }
 
 /// Importance ranking: expect_key must land within top_k.
@@ -3242,6 +3503,7 @@ fn run_render_contract(
 
 fn skeleton_result(scenario: &Scenario, score: f64, detail: String) -> ScenarioResult {
     ScenarioResult {
+        observations: Vec::new(),
         id: scenario.id.clone(),
         dimension: scenario.dimension,
         tier: scenario.tier,
@@ -3614,15 +3876,20 @@ fn build_report(results: Vec<ScenarioResult>, dataset_path: &Path) -> BrainBench
         .filter(|r| !r.skipped)
         .map(|r| r.score)
         .collect();
-    let overall_index = mean(&scored);
+    let scenario_weighted_index = mean(&scored);
+    let overall_index = mean(&by_dimension.values().map(|d| d.mean).collect::<Vec<_>>());
 
     BrainBenchReport {
         generated_at: now,
         dataset: dataset_path.to_string_lossy().to_string(),
+        session_configuration: Some(
+            serde_json::json!({"warm_start":false,"include_ambient":false}),
+        ),
         scenarios: results,
         by_dimension_tier,
         by_dimension,
         overall_index,
+        scenario_weighted_index,
     }
 }
 
@@ -3645,18 +3912,21 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 description: "plain recall of a build command".to_string(),
                 memories: vec![
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "build-cmd".to_string(),
                         text: "The project is built with `cargo build --release` from the bench directory.".to_string(),
                         scope: "project".to_string(),
                         kind: "fact".to_string(),
                     },
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "test-cmd".to_string(),
                         text: "Run the test suite with `cargo test` from the workspace root.".to_string(),
                         scope: "project".to_string(),
                         kind: "fact".to_string(),
                     },
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "lint-cmd".to_string(),
                         text: "Lint the codebase with `cargo clippy --all-targets`.".to_string(),
                         scope: "project".to_string(),
@@ -3689,12 +3959,14 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 description: "knowledge update: env var supersedes config.toml".to_string(),
                 memories: vec![
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "cheap-model-old".to_string(),
                         text: "The cheap model is configured in config.toml under the [models] section.".to_string(),
                         scope: "project".to_string(),
                         kind: "fact".to_string(),
                     },
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "cheap-model-new".to_string(),
                         text: "The cheap model is now set via the KIMETSU_CHEAP_MODEL environment variable, not config.toml.".to_string(),
                         scope: "project".to_string(),
@@ -3727,18 +3999,21 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 description: "salient security memory should rank within top-4".to_string(),
                 memories: vec![
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "secret-rule".to_string(),
                         text: "Never commit API keys or secrets to the repository; use the .env file which is gitignored.".to_string(),
                         scope: "project".to_string(),
                         kind: "fact".to_string(),
                     },
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "format-pref".to_string(),
                         text: "The team prefers 4-space indentation in Python files.".to_string(),
                         scope: "project".to_string(),
                         kind: "fact".to_string(),
                     },
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "ci-note".to_string(),
                         text: "CI runs on GitHub Actions on every push to main.".to_string(),
                         scope: "project".to_string(),
@@ -3771,18 +4046,21 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
                 description: "two paraphrases of the same DB-path fact".to_string(),
                 memories: vec![
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "db-path-a".to_string(),
                         text: "The brain database lives at .kimetsu/brain.db in the workspace.".to_string(),
                         scope: "project".to_string(),
                         kind: "fact".to_string(),
                     },
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "db-path-b".to_string(),
                         text: "The workspace stores its brain database at .kimetsu/brain.db.".to_string(),
                         scope: "project".to_string(),
                         kind: "fact".to_string(),
                     },
                     Memory {
+                        valid_from: None, valid_to: None,
                         key: "editor-pref".to_string(),
                         text: "The default editor for commit messages is vim.".to_string(),
                         scope: "project".to_string(),
@@ -3818,6 +4096,40 @@ pub fn synthetic_fixture() -> BrainBenchDataset {
 mod tests {
     use super::*;
 
+    #[test]
+    fn model_override_survives_new_project_retrieval_preset() {
+        for model in ["ms-marco-minilm-l-4-v2", "off"] {
+            let mut config = kimetsu_core::config::ProjectConfig::default_for_project("benchmark");
+            config.retrieval.level = "deep".into();
+            for (key, value) in brain_config_overrides(Some(model)) {
+                match key {
+                    "broker.warm_start" => config.broker.warm_start = value.parse().unwrap(),
+                    "retrieval.level" => config.retrieval.level = value.into(),
+                    "embedder.reranker" => config.embedder.reranker = value.into(),
+                    _ => panic!("unexpected override {key}"),
+                }
+                config.apply_retrieval_level();
+            }
+            assert_eq!(config.embedder.reranker, model);
+        }
+    }
+
+    #[test]
+    fn retrieval_measurements_disable_unscored_warm_start_for_every_model() {
+        for model in [None, Some("ms-marco-tinybert-l-2-v2"), Some("off")] {
+            let mut config = kimetsu_core::config::ProjectConfig::default_for_project("benchmark");
+            for (key, value) in brain_config_overrides(model) {
+                if key == "broker.warm_start" {
+                    config.broker.warm_start = value.parse().unwrap();
+                }
+            }
+            assert!(
+                !config.broker.warm_start,
+                "warm text is outside capsule gold coverage"
+            );
+        }
+    }
+
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
     }
@@ -3837,8 +4149,10 @@ mod tests {
         // Stale outranks relevant -> gated to 0 despite recall hit.
         let es = score_workflow_episode(&s(&["old", "new"]), &s(&["new"]), &s(&["old"]), &[], 4);
         assert_eq!(es.score, 0.0);
-        // Relevant outranks stale -> full recall credit.
+        // Even below the correct answer, stale context violates the contract.
         let es = score_workflow_episode(&s(&["new", "old"]), &s(&["new"]), &s(&["old"]), &[], 4);
+        assert_eq!(es.score, 0.0);
+        let es = score_workflow_episode(&s(&["new"]), &s(&["new"]), &s(&["old"]), &[], 4);
         assert_eq!(es.score, 1.0);
     }
 
@@ -4446,9 +4760,125 @@ mod tests {
     // ── Report building ───────────────────────────────────────────────────────
 
     #[test]
+    fn report_does_not_let_calibration_volume_hide_failed_retrieval() {
+        let mut results = vec![ScenarioResult {
+            observations: Vec::new(),
+            id: "retrieval-miss".into(),
+            dimension: Dimension::Retrieval,
+            tier: Tier::Easy,
+            score: 0.0,
+            skipped: false,
+            detail: "miss".into(),
+        }];
+        for i in 0..9 {
+            results.push(ScenarioResult {
+                observations: Vec::new(),
+                id: format!("calibration-{i}"),
+                dimension: Dimension::Calibration,
+                tier: Tier::Easy,
+                score: 1.0,
+                skipped: false,
+                detail: "ok".into(),
+            });
+        }
+        let report = build_report(results, Path::new("test.json"));
+        assert_eq!(report.overall_index, 0.5);
+    }
+
+    #[test]
+    fn irrelevant_memory_is_not_perfect_no_answer_retrieval() {
+        assert_eq!(retrieval_score(&["unrelated".into()], &[], &[]), 0.0);
+        assert_eq!(retrieval_score(&[], &[], &[]), 1.0);
+    }
+
+    #[test]
+    fn retrieval_rejects_stale_context_even_below_correct_answer() {
+        assert_eq!(
+            retrieval_score(
+                &s(&["current", "expired"]),
+                &s(&["current"]),
+                &s(&["expired"])
+            ),
+            0.0
+        );
+        assert_eq!(
+            retrieval_score(&s(&["current"]), &s(&["current"]), &s(&["expired"])),
+            1.0
+        );
+    }
+
+    #[test]
+    fn dated_compressed_capsule_matches_visible_fixture_text() {
+        let memories = vec![Memory { key: "gold".into(), text: "Use stdout for protocol. Send diagnostics to stderr. Keep logs separate. Extra explanation.".into(), scope: "project".into(), kind: "fact".into(), valid_from: None, valid_to: None }];
+        let payload = serde_json::json!({"capsules":[{"summary":"project:fact - [2026-09-07] Use stdout for protocol. Send diagnostics to stderr. Keep logs separate."}]});
+        assert_eq!(
+            ranked_fixture_keys(&payload, &memories).unwrap(),
+            vec!["gold"]
+        );
+        let unrelated = serde_json::json!({"capsules":[{"summary":"project:fact - [2026-09-07] Use a different database."}]});
+        assert_ne!(
+            ranked_fixture_keys(&unrelated, &memories).unwrap(),
+            vec!["gold"]
+        );
+    }
+
+    #[test]
+    fn query_observation_retains_delivered_answerability() {
+        let measurement = super::super::brain_mcp::McpMeasurement {
+            payload: serde_json::json!({"answerability":{"status":"partial","missing":["timeout"]}}),
+            text_bytes: 0,
+            result_bytes: 0,
+            wire_bytes: 0,
+            latency_ms: 1.0,
+            first_query: false,
+            server_startup_ms: 0.0,
+            working_set_bytes: None,
+            peak_working_set_bytes: None,
+        };
+        let observation = observe_query("q", &[], &[], &[], &measurement);
+        assert_eq!(
+            serde_json::to_value(observation).unwrap()["answerability"]["missing"],
+            serde_json::json!(["timeout"])
+        );
+    }
+    #[test]
+    fn unknown_capsules_keep_their_rank_and_count_as_injection() {
+        let memories = vec![Memory {
+            valid_from: None,
+            valid_to: None,
+            key: "known".into(),
+            text: "known evidence".into(),
+            scope: "project".into(),
+            kind: "fact".into(),
+        }];
+        let payload = serde_json::json!({"capsules": [
+            {"summary": "unmatched evidence"}, {"summary": "known evidence"}
+        ]});
+        let ranked = ranked_fixture_keys(&payload, &memories).unwrap();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(mrr(&ranked, &["known".into()]), 0.5);
+        assert_eq!(retrieval_score(&ranked, &[], &[]), 0.0);
+    }
+
+    #[test]
+    fn malformed_capsule_summary_is_an_error() {
+        for malformed in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"summary": null}),
+            serde_json::json!({"summary": 42}),
+        ] {
+            let payload = serde_json::json!({"capsules": [malformed]});
+            let error = ranked_fixture_keys(&payload, &[]).unwrap_err();
+            assert!(error.to_string().contains("capsule 0"));
+        }
+    }
+
+    #[test]
     fn build_report_excludes_skipped_from_index() {
         let results = vec![
             ScenarioResult {
+                observations: Vec::new(),
                 id: "r1".to_string(),
                 dimension: Dimension::Retrieval,
                 tier: Tier::Easy,
@@ -4457,6 +4887,7 @@ mod tests {
                 detail: "ok".to_string(),
             },
             ScenarioResult {
+                observations: Vec::new(),
                 id: "r2".to_string(),
                 dimension: Dimension::Retrieval,
                 tier: Tier::Easy,
@@ -4465,6 +4896,7 @@ mod tests {
                 detail: "miss".to_string(),
             },
             ScenarioResult {
+                observations: Vec::new(),
                 id: "f1".to_string(),
                 dimension: Dimension::Forgetting,
                 tier: Tier::Medium,
@@ -4495,14 +4927,20 @@ mod tests {
         let fixture = EvalFixtureFile {
             memories: vec![
                 EvalFixMemory {
+                    valid_from: None,
+                    valid_to: None,
                     key: "m-old".to_string(),
                     text: "old value".to_string(),
                 },
                 EvalFixMemory {
+                    valid_from: None,
+                    valid_to: None,
                     key: "m-new".to_string(),
                     text: "new value".to_string(),
                 },
                 EvalFixMemory {
+                    valid_from: None,
+                    valid_to: None,
                     key: "m-plain".to_string(),
                     text: "a plain fact".to_string(),
                 },
@@ -4580,6 +5018,8 @@ mod tests {
     fn write_pool(dir: &Path, name: &str, n: usize) -> PathBuf {
         let memories: Vec<EvalFixMemory> = (0..n)
             .map(|i| EvalFixMemory {
+                valid_from: None,
+                valid_to: None,
                 key: format!("m{i}"),
                 text: format!("distinct fact number {i} about subsystem {i}"),
             })
