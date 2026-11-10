@@ -1,0 +1,18 @@
+# Actual public artifact sources (downloads used Python urllib or curl; no auth):
+https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json
+https://raw.githubusercontent.com/snap-research/locomo/main/task_eval/evaluation.py
+https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json
+https://raw.githubusercontent.com/xiaowu0162/LongMemEval/main/src/evaluation/evaluate_qa.py
+https://github.com/ggml-org/llama.cpp/releases/download/b12189/llama-b12189-bin-ubuntu-x64.tar.gz
+https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_k_m.gguf
+
+uv venv /workspace/kimetsu-memory-bench/.venv
+uv pip install --python /workspace/kimetsu-memory-bench/.venv/bin/python nltk rouge-score matplotlib
+uv pip freeze --python /workspace/kimetsu-memory-bench/.venv/bin/python > requirements.lock
+./vendor/llama-b12189/llama-server -m ./vendor/qwen.gguf --host 127.0.0.1 --port 18081 -c 8192 -t 4 -tb 4 -np 1 --no-warmup > logs/llama-server.log 2>&1
+.venv/bin/python run.py > logs/run.log 2>&1
+.venv/bin/python report.py > logs/report.log 2>&1
+
+# Every real Kimetsu CLI/MCP operation and every model request/response is logged
+# including its exact args, workspace, and timer in logs/operations.jsonl.
+# Workspaces are disposable below this directory; live team brain never used.
